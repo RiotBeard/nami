@@ -95,6 +95,7 @@ contextBridge.exposeInMainWorld('dainami', {
   viewSet: (view) => ipcRenderer.invoke('view:set', view),
   settingsGet: () => ipcRenderer.invoke('settings:get'),
   settingsSet: (patch) => ipcRenderer.invoke('settings:set', patch),
+  keysRetry: () => ipcRenderer.invoke('keys:retry'),
   keysGet: () => ipcRenderer.invoke('keys:get'),
   settingsReveal: () => ipcRenderer.invoke('settings:reveal'),
   keysSet: (name, value) => ipcRenderer.invoke('keys:set', { name, value }),

@@ -96,8 +96,9 @@ No API key is set. If your `claude` lives elsewhere, set
 
 ⌘, or the ⚙ in the topbar. **Voice** picks how Nami hears you, **Look** switches
 desks, **Models** configures the OpenAI-compatible endpoint behind "any AI model"
-sessions. Everything lands in `settings.json` under the app's userData, on that
-Mac only — nothing syncs. API keys typed there beat `OPENAI_API_KEY` /
+sessions. Preferences land in `settings.json`; API keys are encrypted in `credentials.json`
+under the app's userData, on that Mac only — nothing syncs. See
+[saved-key protection and recovery](docs/credential-storage.md). API keys typed there beat `OPENAI_API_KEY` /
 `ELEVENLABS_API_KEY` from the shell; a key that came from the environment is
 shown as read-only.
 

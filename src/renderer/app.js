@@ -4990,7 +4990,7 @@ function renderAgentInstalled(a) {
     const v = keyInput && keyInput.value.trim();
     if (!v) { toast('Paste the secret first.'); return; }
     const res = await api.keysSet(GROK_API_KEY, v);
-    if (!res.ok) { toast(res.error || 'Could not save it.'); return; }
+    if (!res.ok) { toast(res.error || 'Could not save it.'); refreshKeys(); return; }
     S.overlay.editGrokKey = false;
     toast(`${GROK_API_KEY} saved — every new session gets it.`);
     // Grok prefers a session token over the env key. Logging out is what
@@ -6142,6 +6142,7 @@ function keyEditRowHtml(name, current) {
 function keysPaneHtml() {
   const o = S.overlay;
   if (!o.keys) return '<p class="setup-copy">Looking for your keys…</p>';
+  if (o.keys.ok === false) return `<p class="setup-copy" role="alert">${esc(o.keys.error)}</p><button class="k-act" id="keys-retry">Retry secure storage</button>`;
   const stored = o.keys.stored, have = new Set(stored.map((k) => k.name));
   const rows = [];
   for (const k of stored) {
@@ -6161,25 +6162,28 @@ function keysPaneHtml() {
   return `<p class="setup-copy">Paste a key once and it lands in the environment of every session Nami
     starts — agents, terminals, harnesses. Voice reads the same keys.</p>
     ${rows.join('')}
+    ${(o.keys.legacy || []).map(k => keyRowHtml({ name: k.name, value: o.reveal?.name === k.name ? o.reveal.value : k.masked, actions: [o.reveal?.name === k.name ? 'hide' : 'show', 'remove'] })).join('')}
     <div class="key-row key-row--new">
       <input class="text-input k-input k-name-input" id="key-new-name" placeholder="MY_SERVICE_KEY" spellcheck="false" />
       <input class="text-input k-input" id="key-new-val" type="password" placeholder="paste the secret…" spellcheck="false" />
       <button class="k-act k-save" id="key-new-save">save</button></div>
-    <div class="key-note">saved in <span class="k-open" id="key-note-open">settings.json</span> — click to see the file</div>`;
+    <div class="key-note">encrypted in <span class="k-open" id="key-note-open">credentials.json</span> — click to see the file</div>`;
 }
 function refreshKeys() {
   return api.keysGet().then((res) => {
-    if (isSettingsOpen()) { S.overlay.keys = res; renderOverlay(); }
+    if (isSettingsOpen()) { S.overlay.keys = res; if (!res.ok) S.overlay.reveal = null; renderOverlay(); }
   });
 }
 function wireKeysPane(modal) {
   const o = S.overlay;
   if (o.keys === undefined) { o.keys = null; refreshKeys(); }
+  const retry = q('#keys-retry', modal);
+  if (retry) retry.onclick = async () => { await api.keysRetry(); refreshKeys(); refreshSttInfo(); };
   const saveKey = async (name, input) => {
     const v = input.value.trim();
     if (!v) { toast('Paste the secret first.'); return; }
     const res = await api.keysSet(name, v);
-    if (!res.ok) { toast(res.error || 'Could not save it.'); return; }
+    if (!res.ok) { toast(res.error || 'Could not save it.'); refreshKeys(); return; }
     o.editKey = null; o.reveal = null;
     toast(`${name} saved — every new session gets it.`);
     refreshKeys(); refreshSttInfo(); // Voice's ready flags read the same store
@@ -6191,9 +6195,9 @@ function wireKeysPane(modal) {
       if (act === 'add' || act === 'edit') { o.editKey = name; o.reveal = null; renderOverlay(); const i = q('#key-edit-val'); if (i) i.focus(); }
       else if (act === 'save') saveKey(name, q('#key-edit-val', modal));
       else if (act === 'cancel') { o.editKey = null; renderOverlay(); }
-      else if (act === 'show') { const r = await api.keysReveal(name); o.reveal = { name, value: r.value }; renderOverlay(); }
+      else if (act === 'show') { const r = await api.keysReveal(name); if (!r.ok) { toast(r.error); refreshKeys(); return; } o.reveal = { name, value: r.value }; renderOverlay(); }
       else if (act === 'hide') { o.reveal = null; renderOverlay(); }
-      else if (act === 'remove') { o.reveal = null; await api.keysDelete(name); toast(`${name} removed.`); refreshKeys(); refreshSttInfo(); }
+      else if (act === 'remove') { o.reveal = null; const result = await api.keysDelete(name); if (!result.ok) { toast(result.error); refreshKeys(); return; } toast(`${name} removed.`); refreshKeys(); refreshSttInfo(); }
     };
   });
   const editInput = q('#key-edit-val', modal);

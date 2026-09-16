@@ -2,7 +2,7 @@
 // Owns: the window, PTY terminal sessions,
 // the open folder + its .claude scan, restart-proof state, and all IPC.
 
-const { app, BrowserWindow, ipcMain: electronIpc, dialog, shell, clipboard, protocol, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain: electronIpc, dialog, shell, clipboard, protocol, Menu, nativeImage, safeStorage } = require('electron');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
@@ -35,6 +35,7 @@ const { createDirWatch } = require('./dir-watch');
 const { fmtSize, listDirectory, readTree } = require('./workspace-tree');
 const { ptyCwd } = require('./pty-cwd');
 const settingsStore = require('./settings');
+const { createCredentialStore, preferences, LEGACY, ERROR: CREDENTIAL_ERROR } = require('./credential-store');
 const { migrateRecents, sortRecents, rememberFolderIn, setPinnedIn, removeFrom } = require('./recents');
 const { windowChrome } = require('./platform');
 const { seedStartHere } = require('./start-here');
@@ -169,8 +170,27 @@ function persist(partial) {
 // ---- settings (how the app behaves: theme, model, transcription) ------------
 // Every write merges and renames — see settings.js for why.
 function settingsFile() { return path.join(app.getPath('userData'), 'settings.json'); }
-function readSettings() { return settingsStore.readSettings({ file: settingsFile() }); }
-function writeSettings(patch) { return settingsStore.writeSettings({ file: settingsFile(), patch }); }
+let credentials;
+function credentialStore() {
+  return credentials || (credentials = createCredentialStore({ file: path.join(app.getPath('userData'), 'credentials.json'), settingsFile: settingsFile(), encryption: safeStorage }));
+}
+function readSettings() { return preferences(settingsStore.readSettings({ file: settingsFile() })); }
+function writeSettings(patch) {
+  // Do not replace an unreadable migration source through the preferences path.
+  try {
+    if (fs.existsSync(settingsFile())) {
+      const doc = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error();
+    }
+  } catch (_) { return { ok: false, error: 'Could not read preferences. Restore the settings file before saving.' }; }
+  if (LEGACY.some(k => Object.prototype.hasOwnProperty.call(patch, k))) {
+    const result = credentialStore().setLegacy(patch);
+    if (!result.ok) return result;
+  }
+  const result = settingsStore.writeSettings({ file: settingsFile(), patch: preferences(patch) });
+  return result.ok ? { ok: true } : { ok: false, error: 'Could not save preferences.' };
+}
+function credentialSettings() { return { ...readSettings(), ...credentialStore().context() }; }
 
 function sendWc(wc, channel, payload) { if (wc && !wc.isDestroyed()) wc.send(channel, payload); }
 
@@ -453,6 +473,7 @@ function reapSessions(wcId) {
 }
 
 app.whenReady().then(() => {
+  credentialStore().initialize();
   loadState();
   // Before any window: the menu belongs to the app, and setting it after a
   // window exists makes the first one flash the stock menu bar.
@@ -751,7 +772,10 @@ ipcMain.handle('agents:detect', async () => {
 // never stall the launcher, so every failure lands on signedIn: null.
 // storedEnvKeys so a pasted XAI_API_KEY counts as signed in for grok — the
 // parser only receives a boolean, never the secret (agent-status.js).
-ipcMain.handle('agents:status', (_e, { id } = {}) => agentStatus(id, { envKeys: storedEnvKeys() }));
+ipcMain.handle('agents:status', async (_e, { id } = {}) => {
+  try { return await agentStatus(id, { envKeys: storedEnvKeys() }); }
+  catch (_) { return { ok: false, error: credentialStore().status().ok ? 'Could not check agent status.' : CREDENTIAL_ERROR }; }
+});
 // Removal is planned before it is done, so the confirm can name real paths.
 ipcMain.handle('agents:removalPlan', (_e, { id, binPath } = {}) =>
   planRemoval({ id, binPath, home: os.homedir() }));
@@ -935,46 +959,17 @@ const WRITABLE_SETTINGS = new Set([
   'sttProvider', 'openaiKey', 'elevenKey', 'openaiModel', 'elevenModel',
   'sttModelId',
 ]);
-ipcMain.handle('settings:get', () => {
-  const s = readSettings();
-  // keys never travel back to the renderer in full — it only needs to know one exists
-  const out = Object.assign({}, s, {
-    openaiKey: s.openaiKey ? '••••' + String(s.openaiKey).slice(-4) : '',
-    elevenKey: s.elevenKey ? '••••' + String(s.elevenKey).slice(-4) : '',
-    sttKey: s.sttKey ? '••••' + String(s.sttKey).slice(-4) : '',
-  });
-  delete out.envKeys; // full secrets — the Keys pane has its own masked channel
-  return out;
-});
-
-// ---- IPC: keys — named secrets every session inherits ----------------------
-// Stored under settings.envKeys and exported into each PTY's environment at
-// spawn, so agents find their keys without the user configuring anything else.
-const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
-function storedEnvKeys() { const k = readSettings().envKeys; return (k && typeof k === 'object' && !Array.isArray(k)) ? k : {}; }
+ipcMain.handle('settings:get', () => ({ ...readSettings(), credentialStorage: credentialStore().status() }));
+function storedEnvKeys() { return credentialStore().context().envKeys; }
 ipcMain.handle('keys:get', () => {
-  const stored = storedEnvKeys();
-  return {
-    stored: Object.keys(stored).sort().map((name) => ({
-      name,
-      masked: '••••••••' + String(stored[name]).slice(-4),
-    })),
-  };
+  const result = credentialStore().list();
+  return { stored: [], legacy: [], ...result };
 });
-ipcMain.handle('settings:reveal', () => { try { shell.showItemInFolder(settingsFile()); } catch (_) {} });
-ipcMain.handle('keys:set', (_e, { name, value }) => {
-  if (!KEY_NAME_RE.test(String(name || ''))) return { ok: false, error: 'The name has to look like AN_ENV_VAR.' };
-  if (!value || !String(value).trim()) return { ok: false, error: 'Paste the secret first.' };
-  const next = Object.assign({}, storedEnvKeys(), { [name]: String(value).trim() });
-  const res = writeSettings({ envKeys: next });
-  return res.ok ? { ok: true } : res;
-});
-ipcMain.handle('keys:delete', (_e, { name }) => {
-  const next = Object.assign({}, storedEnvKeys()); delete next[name];
-  const res = writeSettings({ envKeys: next });
-  return res.ok ? { ok: true } : res;
-});
-ipcMain.handle('keys:reveal', (_e, { name }) => ({ value: storedEnvKeys()[name] || '' }));
+ipcMain.handle('keys:retry', () => credentialStore().initialize());
+ipcMain.handle('settings:reveal', () => { try { shell.showItemInFolder(path.join(app.getPath('userData'), 'credentials.json')); } catch (_) {} });
+ipcMain.handle('keys:set', (_e, args) => credentialStore().set(args?.name, args?.value));
+ipcMain.handle('keys:delete', (_e, args) => credentialStore().remove(args?.name));
+ipcMain.handle('keys:reveal', (_e, args) => credentialStore().reveal(args?.name));
 ipcMain.handle('settings:set', (_e, patch) => {
   const clean = {};
   for (const [k, v] of Object.entries(patch || {})) if (WRITABLE_SETTINGS.has(k)) clean[k] = v;
@@ -1291,8 +1286,24 @@ ipcMain.handle('clipboard:read', () => { try { return clipboard.readText(); } ca
 // ---- IPC: dictation → text -------------------------------------------------
 // Which engine runs is stt.js's problem; this only supplies config and a way to
 // report download progress back to the window that asked.
-function sttEnv() { return { settings: readSettings(), env: process.env }; }
-function sttStatus() { return stt.status(sttEnv()); }
+function sttEnv() {
+  if (!credentialStore().status().ok) {
+    const settings = readSettings();
+    if (!settings.sttProvider || settings.sttProvider === 'local') return { settings: { ...settings, sttProvider: 'local' }, env: {} };
+  }
+  return { settings: credentialSettings(), env: process.env };
+}
+function sttStatus() {
+  try { return stt.status(sttEnv()); }
+  catch (_) {
+    const status = stt.status({ settings: readSettings(), env: {} });
+    for (const provider of status.providers) if (provider.needsKey) {
+      provider.ready = false;
+      provider.reason = 'Saved keys unavailable. Open Settings → Keys to retry.';
+    }
+    return { ...status, credentialStorage: credentialStore().status() };
+  }
+}
 
 // Whisper weights live in one writable folder under userData. A packaged build
 // ships tiny.en inside the app bundle, which is read-only, so on first launch we
@@ -1310,16 +1321,15 @@ function sttModelDir() {
   return user;
 }
 
-ipcMain.handle('stt:transcribe', (e, clip) =>
-  stt.transcribe(Object.assign(sttEnv(), {
-    clip,
-    deps: { onProgress: (p) => sendWc(e.sender, 'stt:progress', p) },
-  })));
+async function runSpeech(e, operation, clip) {
+  try {
+    return await stt[operation]({ ...sttEnv(), clip,
+      deps: { onProgress: p => sendWc(e.sender, 'stt:progress', p) } });
+  } catch (_) { return { ok: false, error: credentialStore().status().ok ? 'Could not complete the speech request.' : CREDENTIAL_ERROR }; }
+}
+ipcMain.handle('stt:transcribe', (e, clip) => runSpeech(e, 'transcribe', clip));
 ipcMain.handle('stt:status', () => sttStatus());
-ipcMain.handle('stt:prepare', (e) =>
-  stt.prepare(Object.assign(sttEnv(), {
-    deps: { onProgress: (p) => sendWc(e.sender, 'stt:progress', p) },
-  })));
+ipcMain.handle('stt:prepare', e => runSpeech(e, 'prepare'));
 
 // Every session inherits the saved Keys as env vars. A key saved in Nami wins
 // over the shell's own export — what you set in the app is what runs.
