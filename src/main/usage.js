@@ -1,3 +1,4 @@
+const { buildChildEnv } = require('./session-env');
 // Provider quota windows, never inferred from token/context usage.
 const fs = require('node:fs');
 const os = require('node:os');
@@ -185,12 +186,12 @@ function geminiRows(home, agent, now) {
   for (const file of files) { const data = usable(readJson(file)); if (data) rows = mergeReports(rows, geminiUsage(data, now, { id: agent.id, name: agent.name })); }
   return rows;
 }
-function queryCodex(command, envPath, spawnFn = spawn) {
+function queryCodex(command, envPath, spawnFn = spawn, { parentEnv = process.env, settings = {} } = {}) {
   return new Promise((resolve) => {
     let child, buffer = '', done = false;
     const finish = (data) => { if (done) return; done = true; clearTimeout(timer); child?.kill(); resolve(data); };
     const timer = setTimeout(() => finish(null), 6000);
-    try { child = spawnFn(command, ['app-server'], { env: { ...process.env, PATH: envPath || process.env.PATH }, stdio: ['pipe', 'pipe', 'ignore'] }); }
+    try { child = spawnFn(command, ['app-server'], { env: { ...buildChildEnv({ parentEnv, settings, purpose: 'agent', agentId: 'codex' }), PATH: envPath || parentEnv.PATH }, stdio: ['pipe', 'pipe', 'ignore'] }); }
     catch (_) { finish(null); return; }
     child.on('error', () => finish(null)); child.on('exit', () => finish(null)); child.stdin.on('error', () => finish(null));
     const send = (m) => child.stdin.write(JSON.stringify(m) + '\n');
@@ -354,8 +355,8 @@ async function fetchGeminiAccount(home, now, agent, fetchFn) {
 function signedInFile(home, rel) {
   try { return fs.existsSync(path.join(home, ...rel.split('/'))); } catch { return false; }
 }
-async function rowsFor(agent, { home, directory, envPath, now, spawnFn, fetchFn }) {
-  if (agent.id === 'codex') return codexUsage(await queryCodex(agent.path, envPath, spawnFn || spawn), now);
+async function rowsFor(agent, { home, directory, envPath, now, spawnFn, fetchFn, settings }) {
+  if (agent.id === 'codex') return codexUsage(await queryCodex(agent.path, envPath, spawnFn || spawn, { settings }), now);
   if (agent.id === 'claude') return mergeReports(claudeRows(home, directory, now), await fetchClaudeAccount(home, now, fetchFn));
   if (agent.id === 'antigravity' || agent.id === 'gemini') return mergeReports(geminiRows(home, agent, now), await fetchGeminiAccount(home, now, agent, fetchFn));
   if (agent.id === 'grok') return fetchGrokAccount(home, now, agent, fetchFn);
@@ -374,13 +375,13 @@ function missingDetail(agent, home) {
   if ((agent.id === 'antigravity' || agent.id === 'gemini') && signedInFile(home, '.gemini/oauth_creds.json')) return 'Could not read Antigravity usage.';
   return 'Sign in with ' + (agent.name || agent.id);
 }
-async function readUsage({ agents, directory, envPath, home, now, spawnFn, fetchFn }) {
+async function readUsage({ agents, directory, envPath, home, now, spawnFn, fetchFn, settings }) {
   home = home || os.homedir();
   now = now ?? Date.now();
   const accounts = [];
   for (const agent of (agents || []).filter((a) => a.found)) {
     let rows = [];
-    try { rows = await rowsFor(agent, { home, directory, envPath, now, spawnFn, fetchFn }); }
+    try { rows = await rowsFor(agent, { home, directory, envPath, now, spawnFn, fetchFn, settings }); }
     catch (_) { rows = []; }
     accounts.push(...(rows.length ? rows : unavailable(agent, missingDetail(agent, home))));
   }

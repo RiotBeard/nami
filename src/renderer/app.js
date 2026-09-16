@@ -16,7 +16,7 @@ import { chipHtml, iconKeyFor, iconSvg, treeIcon, pixIcon, helpIcon } from './ic
 import { resolveTool, originLine, sortKey, isMaster, reachOf } from './agent-reach.mjs';
 import { SHELF_GROUPS, MAC_GROUP_KEYS, CLI_ORDER, shelfOf, cliKey, serviceShelf, isPickerAgent, shouldLoadMac, macCountLabel } from './library-groups.mjs';
 import { receiversOf, knowsCopy } from './receivers.mjs';
-import { agentLaunch } from './agent-launch.mjs';
+import { agentLaunch, terminalAgentOptions } from './agent-launch.mjs';
 import { mountChatPane, CHAT_READY } from './acp-pane.mjs';
 import { grokAuthActions, GROK_API_KEY } from './grok-auth.mjs';
 import { shortAge } from './rel-time.mjs';
@@ -647,7 +647,7 @@ function showScene(name) {
       if (!a) return undefined;
       const p = startPanel({
         kind: 'run', title: `install ${a.name}`, code: code2(a.name), command: a.install,
-        oneShot: true, agentId: a.id, sceneStatic: true,
+        oneShot: true, purpose: 'installer', agentId: a.id, sceneStatic: true,
       });
       if (!p) return undefined;
       await new Promise((r) => requestAnimationFrame(r));
@@ -2642,9 +2642,9 @@ function spawnTerminalTwin(p, draft) {
   const seed = draft || undefined;
   let spawned = null;
   if (p.agentId === 'claude' || (a && a.kind === 'claude')) {
-    spawned = startPanel({ kind: 'claude', title: p.title || 'Claude session', code: 'CC', cwd: p.cwd, sid: p.acpSid, cont: !!p.acpSid, seed });
+    spawned = startPanel({ purpose: 'agent', agentId: 'claude', kind: 'claude', title: p.title || 'Claude session', code: 'CC', cwd: p.cwd, sid: p.acpSid, cont: !!p.acpSid, seed });
   } else if (a && a.bin) {
-    spawned = startPanel({ kind: 'run', title: p.title || a.name, code: code2(a.name), command: a.bin, cwd: p.cwd, acpSid: p.acpSid, cont: !!p.acpSid, seed });
+    spawned = startPanel({ ...terminalAgentOptions(a), title: p.title || a.name, code: code2(a.name), command: a.bin, cwd: p.cwd, acpSid: p.acpSid, cont: !!p.acpSid, seed });
   } else {
     toast('Open it from ⌘N — new session, pick the agent.');
     return;
@@ -3457,7 +3457,7 @@ async function startProcess(p, cols, rows) {
   // A name nami chose deliberately rides down into claude, so the conversation
   // reads the same from every other surface that lists it.
   const name = shouldPushName(p.titleSource) ? p.title : null;
-  await api.termCreate({ id: p.id, cwd: p.cwd, cols, rows, kind: p.kind, command: p.command, program: p.program, args: p.args, seed: p.seed, cont: p.cont, sid: p.sid, acpSid: p.acpSid, name, watchDone: !!p.watchDone });
+  await api.termCreate({ id: p.id, cwd: p.cwd, cols, rows, kind: p.kind, command: p.command, program: p.program, args: p.args, seed: p.seed, cont: p.cont, sid: p.sid, acpSid: p.acpSid, name, watchDone: !!p.watchDone, oneShot: !!p.oneShot, purpose: p.purpose, agentId: p.agentId });
 }
 function setAttention(p) { if (p.id === S.activeId) return; p.attention = true; refreshTileHead(p); refreshRail(); renderHeader(); }
 function clearAttention(p) { if (!p.attention) return; p.attention = false; refreshTileHead(p); refreshRail(); renderHeader(); }
@@ -4469,7 +4469,7 @@ function panelSnapshot() {
     if (p.oneShot && (p.commandDone || p.exited)) {
       return { kind: 'shell', title: p.title, titleSource: p.titleSource, code: p.code, chipKind: p.chipKind, cwd: p.cwd, ...size(p) };
     }
-    return { kind: p.kind, title: p.title, titleSource: p.titleSource, code: p.code, chipKind: p.chipKind, cwd: p.cwd, command: p.command, program: p.program, args: p.args, sid: p.sid, acpSid: p.acpSid, oneShot: p.oneShot, agentId: p.agentId, watchDone: p.watchDone, ...size(p) };
+    return { kind: p.kind, title: p.title, titleSource: p.titleSource, code: p.code, chipKind: p.chipKind, cwd: p.cwd, command: p.command, program: p.program, args: p.args, sid: p.sid, acpSid: p.acpSid, oneShot: p.oneShot, purpose: p.purpose, agentId: p.agentId, watchDone: p.watchDone, ...size(p) };
   });
 }
 function savePanels() {
@@ -4507,7 +4507,7 @@ async function restorePanels(snaps) {
       else if (s.kind === 'viewer') await openFile(s.filePath, { pin: true });
       else if (s.kind === 'card' && s.item) await openCard(s.item, { pin: true });
       else if (s.kind === 'ai') continue; // retired session kind — nothing to bring back
-      else if (s.kind) startPanel({ kind: s.kind, title: s.title, titleSource: s.titleSource, code: s.code, chipKind: s.chipKind, cwd: s.cwd, command: s.command, program: s.program, args: s.args, sid: s.sid, acpSid: s.acpSid, view: s.view, oneShot: s.oneShot, agentId: s.agentId, watchDone: s.watchDone, cont: s.kind === 'claude' ? (!!s.sid || s === newestLegacy) : !!s.acpSid });
+      else if (s.kind) startPanel({ kind: s.kind, title: s.title, titleSource: s.titleSource, code: s.code, chipKind: s.chipKind, cwd: s.cwd, command: s.command, program: s.program, args: s.args, sid: s.sid, acpSid: s.acpSid, view: s.view, oneShot: s.oneShot, purpose: s.purpose, agentId: s.agentId, watchDone: s.watchDone, cont: s.kind === 'claude' ? (!!s.sid || s === newestLegacy) : !!s.acpSid });
       // A snapshot from before spans existed carries none, and a panel with no
       // span renders at the default. That is the whole of the migration.
       if (S.panels.length > before) {
@@ -4831,7 +4831,7 @@ function renderLauncher() {
     const launch = () => {
       closeOverlay();
       withFolder(() => {
-        const p = a.kind === 'claude' ? startPanel({ kind:'claude', title:'Claude session', code:'CC' }) : startPanel({ kind:'run', title:a.name, code:code2(a.name), command:a.bin });
+        const p = a.kind === 'claude' ? startPanel({ ...terminalAgentOptions(a), title:'Claude session', code:'CC' }) : startPanel({ ...terminalAgentOptions(a), title:a.name, code:code2(a.name) });
         attachCompanion(p,companionOf);
       }, a.name);
     };
@@ -4904,7 +4904,7 @@ function renderAgentSetup() {
 function runAgentCommand(agent, command, title) {
   closeOverlay();
   startPanel({
-    kind: 'run', title, code: code2(agent.name), command,
+    purpose: 'agent', agentId: agent.id, kind: 'run', title, code: code2(agent.name), command,
     onExit: () => { refreshAgents(); },
   });
 }
@@ -4992,7 +4992,7 @@ function renderAgentInstalled(a) {
     const res = await api.keysSet(GROK_API_KEY, v);
     if (!res.ok) { toast(res.error || 'Could not save it.'); return; }
     S.overlay.editGrokKey = false;
-    toast(`${GROK_API_KEY} saved — every new session gets it.`);
+    toast(`${GROK_API_KEY} saved — permitted Grok sessions can use it.`);
     // Grok prefers a session token over the env key. Logging out is what
     // makes the key the one the next tile actually uses.
     if (ga && ga.logoutAfterSave && lc.logout) {
@@ -5081,7 +5081,7 @@ function renderAgentInstall(a) {
     // the user to go and press ⌘N themselves.
     withFolder(() => startPanel({
       kind: 'run', title: `install ${a.name}`, code: code2(a.name), command: a.install,
-      oneShot: true, watchDone: true, agentId: a.id,
+      oneShot: true, watchDone: true, purpose: 'installer', agentId: a.id,
       onExit: () => refreshAgents(),
     }), 'this install');
   };
@@ -5331,10 +5331,10 @@ async function reallyLaunchAgent(item, toolId) {
   // improve. Not agentSession(): that stamps titleSource 'flow', the rung that
   // does the freezing.
   const p = startPanel({
-    kind: worker.kind === 'claude' ? 'claude' : 'run',
+    ...terminalAgentOptions(worker),
     command: worker.kind === 'claude' ? undefined
-      : launch.kind === 'flag' ? worker.bin + ' ' + launch.argv.join(' ') : worker.bin,
-    args: worker.kind === 'claude' && launch.kind === 'flag' ? [...launch.argv] : undefined,
+      : launch.kind === 'flag' ? worker.bin + ' ' + launch.argv.map(shellQuote).join(' ') : worker.bin,
+    args: launch.kind === 'flag' ? [...launch.argv] : undefined,
     title: item.name + ' session', code: code2(item.name),
     seed: launch.kind === 'seed' ? launch.seed : undefined,
   });
@@ -5723,7 +5723,7 @@ function closeOverlay() { S.overlay = null; renderOverlay(); }
 const SET_SECTIONS = [
   { id: 'voice', name: 'Voice', lead: 'how Nami hears you' },
   { id: 'look', name: 'Look', lead: 'how Nami looks on this desk' },
-  { id: 'keys', name: 'Keys', lead: 'keys every session can use' },
+  { id: 'keys', name: 'Keys', lead: 'keys for permitted agents and Voice' },
   { id: 'shortcuts', name: 'Shortcuts', lead: 'small moves that make your desk easier to use' },
   { id: 'browser', name: 'Browser', lead: 'browser views your sessions can use' },
   { id: 'usage', name: 'Usage', lead: 'remaining allowance by connected account' },
@@ -6113,10 +6113,8 @@ function wireAboutPane(modal) {
 }
 
 // ---- Models ----------------------------------------------------------------
-// ---- Keys — named secrets every session inherits ---------------------------
-// One obvious place to paste API keys. Each saved key is exported into the
-// environment of every session Nami spawns (shell env still wins), and the
-// Voice providers read the same store — never a second place to paste.
+// ---- Keys — named secrets for permitted agents and Voice -------------------
+// Saved keys override inherited values only for explicitly permitted consumers.
 // Agent CLIs (Claude Code, OpenCode…) carry their own logins — no API key here,
 // except Grok, whose API-key path is the XAI_API_KEY env var.
 const SUGGESTED_KEYS = [
@@ -6158,8 +6156,7 @@ function keysPaneHtml() {
     if (o.editKey === s.name) rows.push(keyEditRowHtml(s.name, ''));
     else rows.push(keyRowHtml({ name: s.name, value: 'not set — ' + s.hint, sub: true, actions: ['add'] }));
   }
-  return `<p class="setup-copy">Paste a key once and it lands in the environment of every session Nami
-    starts — agents, terminals, harnesses. Voice reads the same keys.</p>
+  return `<p class="setup-copy">Saved keys are shared only with permitted agents. Terminals and installers receive no known API keys from Nami. Voice reads its provider keys from this same store.</p>
     ${rows.join('')}
     <div class="key-row key-row--new">
       <input class="text-input k-input k-name-input" id="key-new-name" placeholder="MY_SERVICE_KEY" spellcheck="false" />
@@ -6181,7 +6178,7 @@ function wireKeysPane(modal) {
     const res = await api.keysSet(name, v);
     if (!res.ok) { toast(res.error || 'Could not save it.'); return; }
     o.editKey = null; o.reveal = null;
-    toast(`${name} saved — every new session gets it.`);
+    toast(`${name} saved — permitted agents and Voice can use it.`);
     refreshKeys(); refreshSttInfo(); // Voice's ready flags read the same store
   };
   modal.querySelectorAll('.key-row .k-act').forEach((b) => {
@@ -6450,7 +6447,7 @@ function renderConnectForm() {
     if (install && !o.installed) {
       const dir = installDirOf();
       closeOverlay();
-      startPanel({ kind: 'run', title: 'install ' + svc.name, code: svc.code,
+      startPanel({ kind: 'run', purpose: 'installer', oneShot: true, watchDone: true, title: 'install ' + svc.name, code: svc.code,
         command: 'git clone ' + svc.docs + ' ' + dir + ' && cd ' + dir + ' && npm install && npm run build' });
       toast('When the install finishes, open Connect again: one more click.');
       return;
@@ -6501,7 +6498,7 @@ function chosenAgent(o) {
 function agentSession(worker, opts) {
   // A flow names its session for a reason ("build: dark mode") — that name
   // outranks the ones guessed later, and rides down into claude itself.
-  startPanel(Object.assign({ kind: worker.kind === 'claude' ? 'claude' : 'run',
+  startPanel(Object.assign({ ...terminalAgentOptions(worker),
     titleSource: 'flow',
     command: worker.kind === 'claude' ? undefined : worker.bin }, opts));
 }

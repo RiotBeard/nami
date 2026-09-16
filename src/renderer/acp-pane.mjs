@@ -10,19 +10,8 @@ import { chipHtml, iconKeyFor } from './icons.mjs';
 import { createSessionContextRecorder } from './session-context.mjs';
 import { appendDraft } from './session-draft.mjs';
 
-const CLAUDE_ADAPTER = decodeURIComponent(new URL('../../acp-tools/node_modules/.bin/claude-agent-acp', location.href).pathname);
-// One launch line per agent — probed on this machine (tools/acp-probe.mjs)
-// before its row earns the Chat badge. Everything else about the pane is
-// agent-agnostic: same renderer, same composer, same router.
-const AGENT_LAUNCH = {
-  claude: { command: CLAUDE_ADAPTER, args: [] },
-  kimi: { command: 'kimi', args: ['acp'] },
-  codex: { command: 'npx', args: ['-y', '@zed-industries/codex-acp'] },
-  opencode: { command: 'opencode', args: ['acp'] },
-  grok: { command: 'grok', args: ['agent', 'stdio'] },
-  hermes: { command: 'hermes', args: ['acp'] },
-};
-export const CHAT_READY = Object.keys(AGENT_LAUNCH);
+// Main owns executable/argument selection for these probed ACP agents.
+export const CHAT_READY = ['claude', 'kimi', 'codex', 'opencode', 'grok', 'hermes'];
 
 export function mountChatPane(p, rec, hooks) {
   const api = window.dainami;
@@ -329,8 +318,7 @@ export function mountChatPane(p, rec, hooks) {
   // watches that store for this id and reports the name over session:title.
   const watchTitle = () => { if (api.sessionWatchTitle && p.acpSid) api.sessionWatchTitle({ id: p.id, agent: p.agentId || 'claude', cwd: p.cwd, sid: p.acpSid }); };
   (async () => {
-    const launch = AGENT_LAUNCH[p.agentId] || AGENT_LAUNCH.claude;
-    const started = await api.acpStart({ id: p.id, cwd: p.cwd, command: launch.command, args: launch.args });
+    const started = await api.acpStart({ id: p.id, cwd: p.cwd, agentId: p.agentId || 'claude' });
     if (!started.ok) { transcript.error((p.title || 'The agent') + ' could not start' + (started.error ? ' — ' + started.error : '')); return; }
     try {
       const { session } = await client.connect(p.cwd, await mcpOptions());

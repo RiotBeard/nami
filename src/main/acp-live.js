@@ -1,5 +1,5 @@
-// ACP live bridge — PROTOTYPE (demo mode only).
-// Spawns an ACP agent process (the official claude adapter) and shuttles
+// ACP live bridge for the experimental Chat surface.
+// Spawns a registered ACP agent process and shuttles
 // newline-delimited JSON-RPC between its stdio and the renderer. No protocol
 // logic lives here; the renderer is the ACP client.
 
@@ -8,29 +8,50 @@ const path = require('node:path');
 const fs = require('node:fs');
 const { resolveSpawnProgram } = require('./bin-cache');
 const { userPath } = require('./user-path');
+const { buildChildEnv, redactChildError } = require('./session-env');
 
 const procs = new Map();
 
-function wireAcpLive(ipcMain) {
-  ipcMain.handle('acp:start', async (e, { id, cwd, command, args }) => {
+// Launch definitions belong to main, so a caller cannot attach an agent ID
+// to an arbitrary command to obtain that agent's keys.
+function acpLaunch(agentId) {
+  const launches = {
+    claude: { command: path.join(__dirname, '../../acp-tools/node_modules/.bin/claude-agent-acp'), args: [] },
+    codex: { command: 'npx', args: ['-y', '@zed-industries/codex-acp'], purpose: 'installer' },
+    kimi: { command: 'kimi', args: ['acp'] },
+    opencode: { command: 'opencode', args: ['acp'] },
+    grok: { command: 'grok', args: ['agent', 'stdio'] },
+    hermes: { command: 'hermes', args: ['acp'] },
+  };
+  return Object.prototype.hasOwnProperty.call(launches, agentId) ? launches[agentId] : null;
+}
+
+function wireAcpLive(ipcMain, { readSettings = () => ({}), parentEnv = process.env } = {}) {
+  ipcMain.handle('acp:start', async (e, { id, cwd, agentId }) => {
     if (procs.has(id)) return { ok: true };
-    let cmd = resolveSpawnProgram(command), cmdArgs = args || [];
-    // the claude bridge may not be installed locally — fetch-and-run instead
+    const launch = acpLaunch(agentId);
+    if (!launch) return { ok: false, error: 'Unknown ACP agent.' };
+    let cmd = resolveSpawnProgram(launch.command), cmdArgs = launch.args;
+    let purpose = launch.purpose || 'agent';
+    // The fetch-and-run process is an installer even though it later becomes
+    // an agent. It must not receive ambient provider credentials.
     if (path.isAbsolute(cmd) && !fs.existsSync(cmd)) {
-      if (cmd.includes('claude-agent-acp')) { cmd = 'npx'; cmdArgs = ['-y', '@agentclientprotocol/claude-agent-acp']; }
-      else return { ok: false, error: 'not installed: ' + path.basename(cmd) };
+      if (agentId === 'claude') { cmd = 'npx'; cmdArgs = ['-y', '@agentclientprotocol/claude-agent-acp']; purpose = 'installer'; }
+      else return { ok: false, error: 'Agent is not installed.' };
     }
-    const runCwd = cwd && fs.existsSync(cwd) ? cwd : process.env.HOME;
-    const envPath = await userPath();
+    const settings = readSettings();
+    const runCwd = cwd && fs.existsSync(cwd) ? cwd : parentEnv.HOME;
+    const envPath = await userPath({ settings, env: parentEnv });
+    const diagnostic = (err) => redactChildError(err, { parentEnv, settings });
     let proc;
     try {
       proc = spawn(cmd, cmdArgs, {
         cwd: runCwd,
-        env: { ...process.env, PATH: envPath || ('/opt/homebrew/bin:/usr/local/bin:' + (process.env.PATH || '')) },
+        env: { ...buildChildEnv({ parentEnv, settings, purpose, agentId }), PATH: envPath || ('/opt/homebrew/bin:/usr/local/bin:' + (parentEnv.PATH || '')) },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch (err) {
-      return { ok: false, error: String(err && err.message) };
+      return { ok: false, error: diagnostic(err) };
     }
     procs.set(id, proc);
     const wc = e.sender;
@@ -42,12 +63,12 @@ function wireAcpLive(ipcMain) {
         const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
         if (!line.trim()) continue;
         try { wc.send('acp:msg', { id, msg: JSON.parse(line) }); }
-        catch (_) { wc.send('acp:err', { id, text: line }); }
+        catch (_) { wc.send('acp:err', { id, text: diagnostic(line) }); }
       }
     });
-    proc.stderr.on('data', (d) => wc.send('acp:err', { id, text: d.toString() }));
+    proc.stderr.on('data', (d) => wc.send('acp:err', { id, text: diagnostic(d.toString()) }));
     proc.on('exit', (code) => { procs.delete(id); try { wc.send('acp:exit', { id, code }); } catch (_) {} });
-    proc.on('error', (err) => { procs.delete(id); try { wc.send('acp:err', { id, text: String(err && err.message) }); } catch (_) {} });
+    proc.on('error', (err) => { procs.delete(id); try { wc.send('acp:err', { id, text: diagnostic(err) }); } catch (_) {} });
     return { ok: true };
   });
   ipcMain.handle('acp:send', (_e, { id, payload }) => {

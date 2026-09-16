@@ -17,8 +17,8 @@ const { installAppMenu } = require('./app-menu.js');
 const { oneShotArgs, feedRunDone } = require('./run-done');
 const { startSeedGate } = require('./seed-gate');
 const { readLiveSession, liveSessionChanged } = require('./session-registry');
-const { stripInheritedClaude } = require('./session-env');
-const { detectAgents, agentStatus, findOnDisk } = require('./agents-detect');
+const { buildChildEnv, terminalLaunchPolicy, customAgents, redactChildError } = require('./session-env');
+const { detectAgents, agentStatus, findOnDisk, agentRunCommandAllowed } = require('./agents-detect');
 const { handles: opensHere, chooseTarget } = require('./open-with');
 const { planRemoval, removeAgent } = require('./agent-remove');
 const { KNOWN_SERVICES, serviceById } = require('./services-catalog');
@@ -476,7 +476,7 @@ app.whenReady().then(() => {
   // Ask the login shell for the real PATH now, so the answer is already waiting
   // when the first session spawns. Deliberately not awaited: a slow .zshrc must
   // delay a terminal, never the window.
-  userPath();
+  userPath({ settings: readSettings() });
   // point the on-device engine at its weights, then warm the session in the
   // background so the first dictation isn't the slow one
   try {
@@ -565,15 +565,15 @@ ipcMain.handle('usage:read', async (e) => {
     // Reuse Nami's detected binaries. A usage refresh must not launch a fresh
     // interactive login shell for every provider (rc scripts can hang).
     let timer;
-    const envPath = await Promise.race([userPath(), new Promise((resolve) => { timer = setTimeout(() => resolve(process.env.PATH || ''), 2000); })]);
+    const envPath = await Promise.race([userPath({ settings: readSettings() }), new Promise((resolve) => { timer = setTimeout(() => resolve(process.env.PATH || ''), 2000); })]);
     clearTimeout(timer);
     const agents = await detectAgents({ exec: (bin) => knownBin(bin) || findOnDisk(bin, { env: { ...process.env, PATH: envPath } }) });
-    return require('./usage').readUsage({ agents, directory: path.join(app.getPath('userData'), 'usage'), envPath });
+    return require('./usage').readUsage({ agents, directory: path.join(app.getPath('userData'), 'usage'), envPath, settings: readSettings() });
   })().finally(() => { usagePending = null; });
   return usagePending;
 });
 
-wireAcpLive(ipcMain);
+wireAcpLive(ipcMain, { readSettings });
 ipcMain.handle('link:open', (_e, url) => {
   if (/^https?:\/\//.test(String(url))) shell.openExternal(String(url));
   return { ok: true };
@@ -743,15 +743,16 @@ ipcMain.handle('update:sessions', () => liveSessionCount());
 // only code that asks the user's own shell. Everything that spawns an agent
 // reads that memo instead of guessing (bin-cache.js says why).
 ipcMain.handle('agents:detect', async () => {
-  const agents = await detectAgents();
+  const settings = readSettings();
+  const agents = await detectAgents({ settings });
   rememberBins(agents);
-  return agents;
+  return [...agents, ...customAgents(settings)];
 });
 // Who is signed in to one of them. Lazy and per-agent — a CLI that hangs must
 // never stall the launcher, so every failure lands on signedIn: null.
 // storedEnvKeys so a pasted XAI_API_KEY counts as signed in for grok — the
 // parser only receives a boolean, never the secret (agent-status.js).
-ipcMain.handle('agents:status', (_e, { id } = {}) => agentStatus(id, { envKeys: storedEnvKeys() }));
+ipcMain.handle('agents:status', (_e, { id } = {}) => agentStatus(id, { envKeys: storedEnvKeys(), settings: readSettings() }));
 // Removal is planned before it is done, so the confirm can name real paths.
 ipcMain.handle('agents:removalPlan', (_e, { id, binPath } = {}) =>
   planRemoval({ id, binPath, home: os.homedir() }));
@@ -769,8 +770,8 @@ function catalogForRenderer() {
 function claudeExec(argv) {
   return new Promise((resolve) => {
     const bin = knownBin('claude') || 'claude';
-    execFile(bin, argv, { timeout: 20000 }, (err) => {
-      resolve(err ? { ok: false, error: err.message.split('\n')[0] } : { ok: true });
+    execFile(bin, argv, { timeout: 20000, env: buildChildEnv({ settings: readSettings(), purpose: 'agent', agentId: 'claude' }) }, (err) => {
+      resolve(err ? { ok: false, error: redactChildError(err, { settings: readSettings() }).split('\n')[0] } : { ok: true });
     });
   });
 }
@@ -813,7 +814,7 @@ ipcMain.handle('services:connect', async (_e, { id, values, scope, agentIds, pro
     const delivered = await deliverConnections({ scope, projectPath, agentIds });
     const files = [shortHome(up.file) + ' (the master)'].concat(deliveredNames(delivered));
     const check = entry.command
-      ? await checkServer({ command: entry.command, args: entry.args, env: entry.env || {} })
+      ? await checkServer({ command: entry.command, args: entry.args, env: entry.env || {}, settings: readSettings() })
       : { ok: false, error: 'remote servers are checked by the first session that uses them' };
     return { ok: true, files, delivered, tools: check.ok ? check.tools : 0, checked: check.ok, checkError: check.ok ? null : check.error };
   } catch (e) { return { ok: false, error: e.message }; }
@@ -861,7 +862,7 @@ ipcMain.handle('services:connectCustom', async (_e, { name, address, values, bun
     const delivered = await deliverConnections({ scope, projectPath, agentIds });
     const files = [shortHome(up.file) + ' (the master)'].concat(deliveredNames(delivered));
     const check = entry.command
-      ? await checkServer({ command: entry.command, args: entry.args, env: entry.env || {} })
+      ? await checkServer({ command: entry.command, args: entry.args, env: entry.env || {}, settings: readSettings() })
       : { ok: false, error: 'remote servers are checked by the first session that uses them' };
     return { ok: true, id, files, delivered, tools: check.ok ? check.tools : 0, checked: check.ok, checkError: check.ok ? null : check.error };
   } catch (err) { return { ok: false, error: err.message }; }
@@ -899,7 +900,7 @@ ipcMain.handle('services:disconnect', async (_e, { id, projectPath }) => {
   }
   const viaCli = validServiceId(id) ? await new Promise((resolve) => {
     const bin = knownBin('claude') || 'claude';
-    execFile(bin, ['mcp', 'remove', '--scope', 'user', id], { timeout: 20000 }, (err) => resolve(!err));
+    execFile(bin, ['mcp', 'remove', '--scope', 'user', id], { timeout: 20000, env: buildChildEnv({ settings: readSettings(), purpose: 'agent', agentId: 'claude' }) }, (err) => resolve(!err));
   }) : false;
   if (viaCli) changed.push('claude user settings');
   return { changed };
@@ -947,9 +948,8 @@ ipcMain.handle('settings:get', () => {
   return out;
 });
 
-// ---- IPC: keys — named secrets every session inherits ----------------------
-// Stored under settings.envKeys and exported into each PTY's environment at
-// spawn, so agents find their keys without the user configuring anything else.
+// ---- IPC: keys — named secrets shared by permitted consumers ---------------
+// Stored under settings.envKeys; child-process permissions are applied at spawn.
 const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 function storedEnvKeys() { const k = readSettings().envKeys; return (k && typeof k === 'object' && !Array.isArray(k)) ? k : {}; }
 ipcMain.handle('keys:get', () => {
@@ -1321,38 +1321,39 @@ ipcMain.handle('stt:prepare', (e) =>
     deps: { onProgress: (p) => sendWc(e.sender, 'stt:progress', p) },
   })));
 
-// Every session inherits the saved Keys as env vars. A key saved in Nami wins
-// over the shell's own export — what you set in the app is what runs.
+// Each session receives only credentials allowed for its purpose and agent.
+// An allowed saved key wins over the inherited value.
 //
 // `path` is the user's real login PATH, not the one this process was handed.
 // Launched from the Dock that difference is everything: launchd gives an app
 // four directories, so an agent spawned with it cannot find node, git, or any
 // tool the user installed. A shell tile papers over this by sourcing .zshrc on
 // its way up, but anything spawned directly — claude, a harness — does not.
-function sessionEnv(path) {
+function sessionEnv(path, launch) {
   // stripInheritedClaude first: a tile is a top-level agent, and inheriting the
   // launching conversation's handles makes claude disable transcript saving.
-  const env = Object.assign(stripInheritedClaude(process.env), { TERM: 'xterm-256color', FORCE_COLOR: '1' });
+  let policy = terminalLaunchPolicy(launch);
+  if (launch?.kind === 'run' && policy.purpose === 'agent' && !agentRunCommandAllowed(launch)) policy = { purpose: 'terminal' };
+  const env = Object.assign(buildChildEnv({ parentEnv: process.env, settings: readSettings(), ...policy }), { TERM: 'xterm-256color', FORCE_COLOR: '1' });
   if (path) env.PATH = path;
   // TUIs that check COLORFGBG (vim, htop, some harnesses) pick palettes that
   // suit the theme's ground: "fg;bg" where bg 15=light desk, 0=dark desk.
   const theme = settingsStore.normalizeTheme(readSettings().theme);
   env.COLORFGBG = (theme === 'paper' || theme === 'glass' || theme === 'soft') ? '0;15' : '15;0';
-  for (const [k, v] of Object.entries(storedEnvKeys())) env[k] = v;
   return env;
 }
 
 // ---- IPC: terminal / harness sessions --------------------------------------
 // kind: 'claude' (spawn the logged-in claude directly), 'shell' (a plain shell),
 // 'run' (a shell that then runs `command`), 'harness' (spawn `program args`).
-ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, program, args, seed, cont, sid, acpSid, name, watchDone }) => {
+ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, program, args, seed, cont, sid, acpSid, name, watchDone, oneShot, purpose, agentId }) => {
   const wc = e.sender;
   browserViews.registerSession({id,windowId:wc.id,title:name||command||kind||'Session'});
   if (!pty) { sendWc(wc, 'term:data', { id, data: '\r\n[node-pty unavailable — terminal disabled]\r\n' }); return { ok: false }; }
   // Primed at startup, so by the time anyone opens a tile this is already
   // settled; the await only ever bites on a session created within the first
   // second of launch.
-  const envPath = await userPath();
+  const envPath = await userPath({ settings: readSettings() });
   const shellPath = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
   const claudeExe = resolveClaudeExecutable();
 
@@ -1429,9 +1430,9 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     p = pty.spawn(file, spawnArgs, {
       name: 'xterm-256color', cols: cols || 100, rows: rows || 30,
       cwd: (cwd && fs.existsSync(cwd)) ? cwd : os.homedir(),
-      env: sessionEnv(envPath),
+      env: sessionEnv(envPath, { kind, purpose, agentId, program, command, args, watchDone, oneShot }),
     });
-  } catch (err) { sendWc(wc, 'term:data', { id, data: '\r\n[could not start: ' + err.message + ']\r\n' }); return { ok: false }; }
+  } catch (err) { sendWc(wc, 'term:data', { id, data: '\r\n[could not start: ' + redactChildError(err, { settings: readSettings() }) + ']\r\n' }); return { ok: false }; }
 
   termSessions.set(id, p);
   sessionOwners.set(id, wc.id);

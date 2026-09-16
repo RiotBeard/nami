@@ -101,6 +101,12 @@ Mac only — nothing syncs. API keys typed there beat `OPENAI_API_KEY` /
 `ELEVENLABS_API_KEY` from the shell; a key that came from the environment is
 shown as read-only.
 
+## Child-process credentials
+
+Saved keys are shared only with permitted agents; ordinary terminals and installers
+receive no known ambient API credentials. See [credential permissions](docs/child-process-credentials.md)
+for defaults, settings-file overrides, custom agents, migration, and security limits.
+
 ## Keys
 
 ⌘N new session · ⌘O open folder · ⌘K agents · ⌘W close pane · ⌘S save ·

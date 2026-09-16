@@ -42,22 +42,6 @@ test('term session-id discovery is paired across preload and main', () => {
   assert.match(mainSrc, /'term:session-id'/);
 });
 
-test('agents:status hands stored Keys to grok so an API key counts as signed in', () => {
-  assert.match(mainSrc, /ipcMain.handle\('agents:status'/);
-  assert.match(mainSrc, /agentStatus\(id,\s*\{\s*envKeys:\s*storedEnvKeys\(\)\s*\}/);
-});
-
-test('Chat spawn uses the scanned program and the login PATH', () => {
-  const acpLive = fs.readFileSync(path.join(root, 'src/main/acp-live.js'), 'utf8');
-  assert.match(acpLive, /resolveSpawnProgram\(command\)/);
-  assert.match(acpLive, /userPath\(\)/);
-  assert.doesNotMatch(
-    acpLive,
-    /PATH: '\/opt\/homebrew\/bin:\/usr\/local\/bin:' \+ \(process\.env\.PATH/,
-    'Dock stub PATH is the fallback, not the spawn default',
-  );
-});
-
 // A chat card asks main to watch its session's store for a name. The same
 // button-click check as the library channels: exposed in the preload, handled
 // in main, and the card actually calls it once it has a session id.

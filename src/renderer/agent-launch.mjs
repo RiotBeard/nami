@@ -52,3 +52,13 @@ export function agentLaunch(toolId, slug) {
   if (t.kind === 'flag') return { kind: 'flag', status: t.status, argv: t.argv(slug), seed: '' };
   return { kind: 'seed', status: t.status, argv: [], seed: t.seed(slug) };
 }
+
+// First-party launch sites carry identity explicitly. Custom profiles use a
+// direct executable; shell command text never determines credential grants.
+export function terminalAgentOptions(agent) {
+  return {
+    purpose: 'agent', agentId: agent.id, kind: agent.kind,
+    ...(agent.kind === 'harness' ? { program: agent.program } :
+      agent.kind === 'claude' ? {} : { command: agent.bin }),
+  };
+}

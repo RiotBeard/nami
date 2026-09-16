@@ -38,3 +38,12 @@ test('spawn failure surfaces as a friendly error', async () => {
   assert.equal(out.ok, false);
   assert.match(out.error, /ENOENT|could not start/i);
 });
+
+test('connector spawn receives only explicit keys; errors redact credentials', async () => {
+  let actual;
+  const out = await checkServer({ command: 'nope', parentEnv: { PATH: '/bin', OPENAI_API_KEY: 'ambient', PRIVATE_KEY: 'private' },
+    settings: { envKeys: { PRIVATE_KEY: 'stored' } }, env: { SERVICE_TOKEN: 'explicit' },
+    spawnFn: (_command, _args, opts) => { actual = opts.env; throw new Error('explicit private stored'); } });
+  assert.deepEqual(actual, { PATH: '/bin', SERVICE_TOKEN: 'explicit' });
+  assert.equal(out.error, 'could not start: [redacted] [redacted] [redacted]');
+});

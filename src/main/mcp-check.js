@@ -1,14 +1,15 @@
 // Start an MCP server once over stdio, shake hands, count tools, kill it.
 // "Connected" in the UI is this function saying so, never an assumption.
 const { spawn } = require('child_process');
+const { buildChildEnv, redactChildError } = require('./session-env');
 
-function checkServer({ command, args = [], env = {}, spawnFn = spawn, timeoutMs = 15000 }) {
+function checkServer({ command, args = [], env = {}, spawnFn = spawn, timeoutMs = 15000, parentEnv = process.env, settings = {} }) {
   return new Promise((resolve) => {
     let child;
     try {
-      child = spawnFn(command, args, { env: { ...process.env, ...env }, stdio: ['pipe', 'pipe', 'pipe'] });
+      child = spawnFn(command, args, { env: buildChildEnv({ parentEnv, settings, purpose: 'connector', explicitEnv: env }), stdio: ['pipe', 'pipe', 'pipe'] });
     } catch (e) {
-      resolve({ ok: false, error: 'could not start: ' + e.message });
+      resolve({ ok: false, error: 'could not start: ' + redactChildError(e, { parentEnv, settings, explicitEnv: env }) });
       return;
     }
     let buf = '', done = false, id = 0;
@@ -16,7 +17,7 @@ function checkServer({ command, args = [], env = {}, spawnFn = spawn, timeoutMs 
     const timer = setTimeout(() => finish({ ok: false, error: 'no answer within ' + Math.round(timeoutMs / 1000) + 's' }), timeoutMs);
     const send = (method, params) => { id += 1; try { child.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n'); } catch (_) {} return id; };
     let initId = null, listId = null;
-    child.on('error', (e) => finish({ ok: false, error: 'could not start: ' + e.message }));
+    child.on('error', (e) => finish({ ok: false, error: 'could not start: ' + redactChildError(e, { parentEnv, settings, explicitEnv: env }) }));
     child.stdout.on('data', (d) => {
       buf += d.toString();
       let nl;

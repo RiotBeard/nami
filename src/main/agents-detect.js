@@ -3,6 +3,7 @@
 // from .zshrc/.zprofile count; exec is injectable for tests.
 // Install commands and docs links verified against official sources 2026-08-08.
 const { execFile } = require('node:child_process');
+const { buildChildEnv } = require('./session-env');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const os = require('node:os');
@@ -175,28 +176,28 @@ async function findOnDisk(bin, { home = os.homedir(), env = process.env, platfor
   return '';
 }
 
-function runLoginShell(cmd) {
+function runLoginShell(cmd, { settings = {}, env = process.env, purpose = 'probe', agentId } = {}) {
   const sh = loginShell();
   return new Promise((resolve, reject) => {
     // stdin is closed deliberately: an interactive shell that decides to prompt
     // would otherwise sit there until the timeout with the launcher waiting.
-    execFile(sh.file, sh.args(cmd), { timeout: 8000, stdio: ['ignore', 'pipe', 'pipe'] }, (err, stdout) => {
+    execFile(sh.file, sh.args(cmd), { timeout: 8000, env: buildChildEnv({ parentEnv: env, settings, purpose, agentId }), stdio: ['ignore', 'pipe', 'pipe'] }, (err, stdout) => {
       if (err) return reject(err);
       resolve(String(stdout || ''));
     });
   });
 }
 
-async function shellWhich(bin) {
+async function shellWhich(bin, options) {
   let out = '';
-  try { out = await runLoginShell(whichCommand(bin)); } catch (_) { out = ''; }
+  try { out = await runLoginShell(whichCommand(bin), options); } catch (_) { out = ''; }
   return pathFromShellOutput(out) || findOnDisk(bin);
 }
 
-async function detectAgents({ exec = shellWhich, home = os.homedir() } = {}) {
+async function detectAgents({ exec = shellWhich, home = os.homedir(), settings = {}, env = process.env } = {}) {
   return Promise.all(KNOWN_AGENTS.map(async (a) => {
     let p = '';
-    try { p = String((await exec(a.bin)) || '').trim(); } catch (_) { p = ''; }
+    try { p = String((await exec(a.bin, { settings, env })) || '').trim(); } catch (_) { p = ''; }
     // configFile is the ~-expanded twin of lifecycle.configPath, so the renderer
     // can hand it straight to openFile() without knowing where home is.
     const configFile = a.lifecycle && a.lifecycle.configPath
@@ -237,7 +238,7 @@ function grokApiKeyPresent(envKeys, env) {
     || nonemptyEnv(env, 'XAI_API_KEY') || nonemptyEnv(env, 'GROK_CODE_XAI_API_KEY');
 }
 
-async function agentStatus(id, { exec = shellRun, readFile = readIfPresent, home = os.homedir(), envKeys = {}, env = process.env } = {}) {
+async function agentStatus(id, { exec = shellRun, readFile = readIfPresent, home = os.homedir(), envKeys = {}, env = process.env, settings = {} } = {}) {
   const blank = { id, signedIn: null, label: '', rows: [], source: '' };
   const agent = agentById(id);
   const lc = agent && agent.lifecycle;
@@ -245,7 +246,7 @@ async function agentStatus(id, { exec = shellRun, readFile = readIfPresent, home
   try {
     let payload;
     if (lc.statusCmd) {
-      payload = { stdout: await exec(lc.statusCmd) };
+      payload = { stdout: await exec(lc.statusCmd, { settings, env, purpose: 'agent', agentId: id }) };
     } else if (lc.statusFiles && lc.statusFiles.length) {
       const files = {};
       await Promise.all(lc.statusFiles.map(async (rel) => {
@@ -256,7 +257,10 @@ async function agentStatus(id, { exec = shellRun, readFile = readIfPresent, home
     } else {
       return blank;
     }
-    if (id === 'grok') payload.hasApiKey = grokApiKeyPresent(envKeys, env);
+    if (id === 'grok') {
+      const allowed = buildChildEnv({ parentEnv: env, settings: { ...settings, envKeys: { ...settings.envKeys, ...envKeys } }, purpose: 'agent', agentId: id });
+      payload.hasApiKey = grokApiKeyPresent({}, allowed);
+    }
     return { id, source: lc.source || '', ...parseAgentStatus(id, payload) };
   } catch (_) {
     return blank;
@@ -264,3 +268,20 @@ async function agentStatus(id, { exec = shellRun, readFile = readIfPresent, home
 }
 
 module.exports = { KNOWN_AGENTS, POINTER_FILE, contextFilesFor, detectAgents, agentStatus, agentById, expandHome, pathFromShellOutput, findOnDisk };
+
+// The selected ID comes from launch metadata. Validate its command against
+// main's registry before granting credentials; never infer identity from text.
+function agentRunCommandAllowed({ agentId, command, args } = {}) {
+  const agent = agentById(agentId);
+  if (!agent || typeof command !== 'string') return false;
+  const lc = agent.lifecycle || {};
+  const commands = [agent.bin, lc.login, lc.logout, lc.health, lc.setup, lc.switchCmd, lc.uninstall];
+  if (lc.logout && lc.login) commands.push(`${lc.logout} && ${lc.login}`);
+  if (commands.some((candidate) => typeof candidate === 'string' && command === candidate)) return true;
+  if (!['opencode', 'antigravity'].includes(agentId) || !Array.isArray(args)
+    || args.length !== 2 || args[0] !== '--agent' || typeof args[1] !== 'string' || args[1].includes('\0')) return false;
+  // Match the renderer's always-quoted argv serialization exactly.
+  const quoted = args.map((arg) => "'" + arg.replace(/'/g, "'\\''") + "'");
+  return command === agent.bin + ' ' + quoted.join(' ');
+}
+module.exports.agentRunCommandAllowed = agentRunCommandAllowed;
