@@ -1329,11 +1329,9 @@ ipcMain.handle('stt:prepare', (e) =>
 // four directories, so an agent spawned with it cannot find node, git, or any
 // tool the user installed. A shell tile papers over this by sourcing .zshrc on
 // its way up, but anything spawned directly — claude, a harness — does not.
-function sessionEnv(path, launch) {
+function sessionEnv(path, launch, policy = sessionPolicy(launch)) {
   // stripInheritedClaude first: a tile is a top-level agent, and inheriting the
   // launching conversation's handles makes claude disable transcript saving.
-  let policy = terminalLaunchPolicy(launch);
-  if (launch?.kind === 'run' && policy.purpose === 'agent' && !agentRunCommandAllowed(launch)) policy = { purpose: 'terminal' };
   const env = Object.assign(buildChildEnv({ parentEnv: process.env, settings: readSettings(), ...policy }), { TERM: 'xterm-256color', FORCE_COLOR: '1' });
   if (path) env.PATH = path;
   // TUIs that check COLORFGBG (vim, htop, some harnesses) pick palettes that
@@ -1343,9 +1341,27 @@ function sessionEnv(path, launch) {
   return env;
 }
 
+// The credential policy a launch ends up with, decided once and used for both
+// the environment and the way the process is started. A run tile whose command
+// is not the registered command for its declared agent falls back to a plain
+// terminal: it gets no keys, and it is typed into a shell like any other
+// terminal. The policy shape is what buildChildEnv takes.
+function sessionPolicy(launch) {
+  const policy = terminalLaunchPolicy(launch);
+  if (launch?.kind === 'run' && policy.purpose === 'agent' && !agentRunCommandAllowed(launch)) return { purpose: 'terminal' };
+  return policy;
+}
+
 // ---- IPC: terminal / harness sessions --------------------------------------
 // kind: 'claude' (spawn the logged-in claude directly), 'shell' (a plain shell),
-// 'run' (a shell that then runs `command`), 'harness' (spawn `program args`).
+// 'run' (a shell that runs `command`), 'harness' (spawn `program args`).
+//
+// How a shell-run command reaches the shell depends on the credential policy.
+// A tile whose policy is purpose 'agent' holds that agent's keys, so the shell
+// is started with the command as its script (`-i -c`) and the pty ends when the
+// agent does: no prompt carrying OPENAI_API_KEY is left behind after a Ctrl-C.
+// A tile with no keys — a legacy run tile, a plain shell — is typed into an
+// interactive shell as before and stays a terminal afterwards.
 ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, program, args, seed, cont, sid, acpSid, name, watchDone, oneShot, purpose, agentId }) => {
   const wc = e.sender;
   browserViews.registerSession({id,windowId:wc.id,title:name||command||kind||'Session'});
@@ -1356,6 +1372,8 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
   const envPath = await userPath({ settings: readSettings() });
   const shellPath = process.env.SHELL || (process.platform === 'win32' ? 'powershell.exe' : '/bin/zsh');
   const claudeExe = resolveClaudeExecutable();
+  const launch = { kind, purpose, agentId, program, command, args, watchDone, oneShot };
+  const policy = sessionPolicy(launch);
 
   let file = shellPath, spawnArgs = [], afterStart = null, claudeWatch = null, echoLine = null, discoverAgent = null, storeWatch = null;
   if (kind === 'claude') {
@@ -1384,7 +1402,14 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     // title watcher followed a transcript nothing ever wrote, and the tile came
     // back empty on the next launch. Quoted because --name carries a sentence,
     // and an unquoted sentence arrives as four arguments.
-    else { file = shellPath; afterStart = ['claude', ...claudeArgs, ...extraArgs].map(shellQuote).join(' '); }
+    // The line is the shell's script, not typed (see the policy note above):
+    // this tile carries claude's keys, so it must not outlive claude.
+    else {
+      file = shellPath;
+      const line = ['claude', ...claudeArgs, ...extraArgs].map(shellQuote).join(' ');
+      if (policy.purpose === 'agent') { spawnArgs = ['-i', '-c', line]; echoLine = line; }
+      else afterStart = line;
+    }
   } else if (kind === 'harness' && program) {
     file = program; spawnArgs = Array.isArray(args) ? args : [];
   } else if (kind === 'run' && command) {
@@ -1420,6 +1445,12 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     }
 
     if (watchDone) { spawnArgs = oneShotArgs(shellPath, typed); echoLine = command; }
+    // An agent tile: the shell runs the line as its script and exits with the
+    // agent, so the keys in its environment die with it. Still `-i`, so the
+    // user's rc file is read and `a && b` registry commands work; no `exec`
+    // prefix for the same reason. Unlike a one-shot there is no trailing
+    // `exec <shell> -i` — a fresh prompt is exactly the thing to avoid here.
+    else if (policy.purpose === 'agent') { spawnArgs = ['-i', '-c', typed]; echoLine = command; }
     else afterStart = typed;
   } else {
     file = shellPath;
@@ -1430,7 +1461,7 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     p = pty.spawn(file, spawnArgs, {
       name: 'xterm-256color', cols: cols || 100, rows: rows || 30,
       cwd: (cwd && fs.existsSync(cwd)) ? cwd : os.homedir(),
-      env: sessionEnv(envPath, { kind, purpose, agentId, program, command, args, watchDone, oneShot }),
+      env: sessionEnv(envPath, launch, policy),
     });
   } catch (err) { sendWc(wc, 'term:data', { id, data: '\r\n[could not start: ' + redactChildError(err, { settings: readSettings() }) + ']\r\n' }); return { ok: false }; }
 
@@ -1495,9 +1526,10 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     sendWc(wc, 'term:exit', { id, code: exitCode, signal, deliberate, note: exitNote({ code: exitCode, signal, deliberate }) });
   });
 
-  // Run a launch command in a plain shell (kind 'run' / fallback claude-in-shell).
-  // One branch, and it writes what it was given. The seed is a separate thing
-  // on its own timer below; conflating the two is what dropped claude's args.
+  // Type a launch command into a plain shell (a keyless run tile / the keyless
+  // claude-in-shell fallback). One branch, and it writes what it was given.
+  // The seed is a separate thing on its own timer below; conflating the two
+  // is what dropped claude's args.
   if (afterStart) setTimeout(() => { try { p.write(afterStart + '\r'); } catch (_) {} }, 200);
 
   // Seed a first message into an interactive session once it's ready

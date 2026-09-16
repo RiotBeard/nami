@@ -45,6 +45,15 @@ provider/service names the agent needs. Built-in IDs are `claude`, `codex`,
 
 Changes apply on the next process launch, including restored sessions. Existing
 process environments cannot be revoked in place: close and reopen those tiles.
+
+An agent tile ends when its agent exits. Nami starts the tile's shell with the
+agent command as the shell's script rather than typing the command into an
+interactive prompt, so when the agent finishes or is stopped with Ctrl-C the
+tile closes instead of dropping to a shell prompt that still holds the agent's
+keys. The shell still reads your startup files first. Ordinary terminals and
+older run tiles without launch identity carry no known API keys, so they keep
+their interactive prompt. Installer tiles also keep a prompt afterwards; they
+run without ambient credentials.
 Legacy Claude tiles retain their identity through their dedicated session kind.
 Older run tiles without explicit launch identity receive no ambient credentials;
 reopen the agent from the launcher to create an identified session.
@@ -130,3 +139,8 @@ Built-in run sessions must carry an explicit agent ID and match that agent's
 registered command in the main process. Unrelated or compound command text
 cannot claim another agent's credentials. Legacy run sessions without reliable
 identity remain filtered until reopened through the identified launcher.
+Identified agent sessions run the command as the shell's script and end with
+the agent; a run tile that lost identity is typed into a keyless shell as
+before. Automated coverage includes a real, isolated shell run: the dummy agent
+sees its granted dummy key, and the pty exits with the agent's exit code
+without further input.

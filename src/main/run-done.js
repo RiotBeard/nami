@@ -1,12 +1,16 @@
 // "Did the command Nami typed into that shell finish, and how did it go?"
 //
-// A kind:'run' tile is a real interactive login shell with a command written
-// into it. That is deliberate — it sources the user's rc file, it can ask for a
-// sudo password, and it stays alive afterwards so the output can be read. The
-// cost is that the shell, not Nami, owns the command: pty exit only fires when
-// the *shell* dies, which for an install is usually never. So the install tile
-// sat at a prompt with nothing in the app knowing the install had finished, and
-// the user was told to go and press ⌘N.
+// A kind:'run' tile is a real interactive login shell running a command. That
+// is deliberate — it sources the user's rc file and it can ask for a sudo
+// password. A keyless run tile has the command typed into it and stays alive
+// afterwards so the output can be read; an agent tile, which carries that
+// agent's API keys, is instead started with the command as the shell's script
+// (`-i -c`) and ends when the agent does, so no prompt holding the keys is
+// left behind (main.js, term:create). The cost of the typed form is that the
+// shell, not Nami, owns the command: pty exit only fires when the *shell*
+// dies, which for an install is usually never. So the install tile sat at a
+// prompt with nothing in the app knowing the install had finished, and the
+// user was told to go and press ⌘N.
 //
 // The shell can just say. Appending a printf to the command makes it announce
 // its own exit code the moment it lands:
