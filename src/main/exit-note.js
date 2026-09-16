@@ -14,7 +14,7 @@ const SIGNALS = { 1: 'SIGHUP', 2: 'SIGINT', 3: 'SIGQUIT', 9: 'SIGKILL', 15: 'SIG
 // node-pty reports a signal death either as `signal` or, on some platforms, as
 // an exit code of 128+n with no signal field. Normalise both into a name.
 function signalName({ code, signal } = {}) {
-  if (typeof signal === 'number') return SIGNALS[signal] || ('signal ' + signal);
+  if (typeof signal === 'number' && signal > 0) return SIGNALS[signal] || ('signal ' + signal);
   if (typeof signal === 'string' && signal) return signal;
   const n = Number(code);
   if (Number.isFinite(n) && n > 128 && n < 160) return SIGNALS[n - 128] || ('signal ' + (n - 128));

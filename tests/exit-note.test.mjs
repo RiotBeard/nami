@@ -48,3 +48,9 @@ test('an exit code above the signal range stays a plain exit code', () => {
   // 160+ is not 128+signal on any platform we run on
   assert.equal(exitNote({ code: 200 }), 'exited · 200');
 });
+
+test('node-pty signal zero means no signal and preserves the exit code', () => {
+  assert.equal(exitNote({ code: 0, signal: 0 }), 'finished');
+  assert.equal(exitNote({ code: 7, signal: 0 }), 'exited · 7');
+  assert.equal(exitNote({ code: 130, signal: 0 }), 'stopped');
+});
