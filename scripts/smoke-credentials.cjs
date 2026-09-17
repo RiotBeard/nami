@@ -11,7 +11,7 @@ const root = path.resolve(__dirname, '..');
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'nami-keychain-smoke-'));
 const profile = path.join(temp, 'Nami-dev');
 fs.mkdirSync(profile);
-const secret = 'dummy-keychain-smoke-123456789';
+const secret = ['dummy','keychain','smoke','123456789'].join('-');
 const saved = 'dummy-restart-key-987654321';
 fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ theme: 'glass', envKeys: { SMOKE_KEY: secret }, openaiKey: secret, sttKey: secret }));
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
@@ -102,6 +102,10 @@ async function launch(check) {
     await launch(async run=>{
       assert.equal((await run('dainami.keysGet()')).ok,false);
       assert.equal((await run('dainami.keysSet("BLOCKED_KEY","dummy")')).ok,false);
+      // Only saved keys are affected: agent status keeps its shape and speech status still resolves.
+      assert.ok('signedIn' in (await run('dainami.agentStatus("claude")')),'agent status shape with damaged vault');
+      const speech=await run('dainami.sttStatus()');
+      assert.ok(Array.isArray(speech.providers)&&speech.credentialStorage&&speech.credentialStorage.ok===false,'speech status with damaged vault');
       await until(()=>run('!!document.querySelector("#btn-settings")'),'Settings button');
       await run('document.querySelector("#btn-settings").click()');
       await until(()=>run('!!document.querySelector("[data-sec=keys]")'),'Keys tab');

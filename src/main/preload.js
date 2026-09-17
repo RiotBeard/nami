@@ -98,6 +98,7 @@ contextBridge.exposeInMainWorld('dainami', {
   keysRetry: () => ipcRenderer.invoke('keys:retry'),
   keysGet: () => ipcRenderer.invoke('keys:get'),
   settingsReveal: () => ipcRenderer.invoke('settings:reveal'),
+  settingsRevealFile: () => ipcRenderer.invoke('settings:revealFile'),
   keysSet: (name, value) => ipcRenderer.invoke('keys:set', { name, value }),
   keysDelete: (name) => ipcRenderer.invoke('keys:delete', { name }),
   keysReveal: (name) => ipcRenderer.invoke('keys:reveal', { name }),

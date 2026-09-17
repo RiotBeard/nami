@@ -5880,6 +5880,11 @@ function dlProgressText(ev) {
 // key is missing, or a download button. Keys are typed in exactly one place —
 // the Keys tab — so a ready provider shows nothing extra at all.
 function voiceRowBodyHtml(p) {
+  // Nami cannot read its saved keys right now, so "add it in Keys" would be wrong.
+  if (p.needsKey && !p.ready && S.sttInfo && S.sttInfo.credentialStorage && S.sttInfo.credentialStorage.ok === false) {
+    return `<div class="set-opt-body"><div class="setup-note">saved keys are unavailable —
+        <span class="sv-help go-keys" data-keyenv="${esc(p.keyEnv)}">retry in Keys</span></div></div>`;
+  }
   if (p.needsKey && !p.ready) {
     return `<div class="set-opt-body"><div class="setup-note">needs your ${esc(p.keyEnv)} —
         <span class="sv-help go-keys" data-keyenv="${esc(p.keyEnv)}">add it in Keys</span></div>
@@ -6142,7 +6147,10 @@ function keyEditRowHtml(name, current) {
 function keysPaneHtml() {
   const o = S.overlay;
   if (!o.keys) return '<p class="setup-copy">Looking for your keys…</p>';
-  if (o.keys.ok === false) return `<p class="setup-copy" role="alert">${esc(o.keys.error)}</p><button class="k-act" id="keys-retry">Retry secure storage</button>`;
+  // .k-act is only styled inside a .key-row; out here the themed control is .btn.
+  if (o.keys.ok === false) return `<p class="setup-copy" role="alert">${esc(o.keys.error)}</p>
+    ${o.keys.kind === 'settings' ? '<div class="sv-help" id="keys-show-settings">show settings.json</div>' : ''}
+    <button class="btn" id="keys-retry">Retry secure storage</button>`;
   const stored = o.keys.stored, have = new Set(stored.map((k) => k.name));
   const rows = [];
   for (const k of stored) {
@@ -6179,6 +6187,8 @@ function wireKeysPane(modal) {
   if (o.keys === undefined) { o.keys = null; refreshKeys(); }
   const retry = q('#keys-retry', modal);
   if (retry) retry.onclick = async () => { await api.keysRetry(); refreshKeys(); refreshSttInfo(); };
+  const showSettings = q('#keys-show-settings', modal);
+  if (showSettings) showSettings.onclick = () => api.settingsRevealFile();
   const saveKey = async (name, input) => {
     const v = input.value.trim();
     if (!v) { toast('Paste the secret first.'); return; }

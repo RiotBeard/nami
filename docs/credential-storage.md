@@ -52,10 +52,21 @@ vault have separate storage lifecycles and are outside this change.
 When encryption is unavailable, decryption fails, a format version is unknown, or
 migration cannot finish, Nami preserves the source files and blocks saved-key
 operations. Settings → Keys shows an error and **Retry secure storage**, including
-when a save fails while the pane is already open. Speech and agent IPC return
-structured errors rather than rejected calls on storage failure.
-Ordinary preferences and local speech remain usable when their files are valid.
-Unreadable settings are preserved rather than replaced through preference saves.
+when a save fails while the pane is already open.
+
+Only saved keys are affected. Sessions still start, without the saved keys, and
+print one dim notice pointing at Settings → Keys. Agent status, the local speech
+engine, ordinary preferences, and keys exported in the shell Nami was started
+from all keep working; a keyed speech provider with no key anywhere reports that
+saved keys are unavailable instead of "no API key". Reads are served from the
+vault this process last verified, so one failed save (a full disk, a locked key
+store) returns an error for that save and leaves existing keys usable. The store
+becomes unavailable only when the vault on disk no longer verifies.
+
+An unreadable `settings.json` is reported separately, naming the file, with a
+**show settings.json** link in Settings → Keys. Nami never replaces it through a
+preference save. It blocks a migration that has not finished, because the keys
+to import live there, but not a vault that has already been migrated.
 
 Unlock the system key store, resolve permissions or disk-space problems, then
 retry. For damaged ciphertext, quit Nami and restore a known-good encrypted copy

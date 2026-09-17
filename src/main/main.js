@@ -35,7 +35,7 @@ const { createDirWatch } = require('./dir-watch');
 const { fmtSize, listDirectory, readTree } = require('./workspace-tree');
 const { ptyCwd } = require('./pty-cwd');
 const settingsStore = require('./settings');
-const { createCredentialStore, preferences, LEGACY, ERROR: CREDENTIAL_ERROR } = require('./credential-store');
+const { createCredentialStore, preferences, LEGACY, ERROR: CREDENTIAL_ERROR, SETTINGS_ERROR } = require('./credential-store');
 const { migrateRecents, sortRecents, rememberFolderIn, setPinnedIn, removeFrom } = require('./recents');
 const { windowChrome } = require('./platform');
 const { seedStartHere } = require('./start-here');
@@ -182,7 +182,7 @@ function writeSettings(patch) {
       const doc = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
       if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error();
     }
-  } catch (_) { return { ok: false, error: 'Could not read preferences. Restore the settings file before saving.' }; }
+  } catch (_) { return { ok: false, error: SETTINGS_ERROR }; }
   if (LEGACY.some(k => Object.prototype.hasOwnProperty.call(patch, k))) {
     const result = credentialStore().setLegacy(patch);
     if (!result.ok) return result;
@@ -772,9 +772,10 @@ ipcMain.handle('agents:detect', async () => {
 // never stall the launcher, so every failure lands on signedIn: null.
 // storedEnvKeys so a pasted XAI_API_KEY counts as signed in for grok — the
 // parser only receives a boolean, never the secret (agent-status.js).
+// storedEnvKeys() is empty, never an error, while saved keys are unavailable.
 ipcMain.handle('agents:status', async (_e, { id } = {}) => {
   try { return await agentStatus(id, { envKeys: storedEnvKeys() }); }
-  catch (_) { return { ok: false, error: credentialStore().status().ok ? 'Could not check agent status.' : CREDENTIAL_ERROR }; }
+  catch (_) { return { id, signedIn: null, label: '', rows: [], source: '' }; } // agentStatus's own blank
 });
 // Removal is planned before it is done, so the confirm can name real paths.
 ipcMain.handle('agents:removalPlan', (_e, { id, binPath } = {}) =>
@@ -959,7 +960,8 @@ const WRITABLE_SETTINGS = new Set([
   'sttProvider', 'openaiKey', 'elevenKey', 'openaiModel', 'elevenModel',
   'sttModelId',
 ]);
-ipcMain.handle('settings:get', () => ({ ...readSettings(), credentialStorage: credentialStore().status() }));
+// readSettings() carries no key fields: the Keys pane has its own masked channel.
+ipcMain.handle('settings:get', () => readSettings());
 function storedEnvKeys() { return credentialStore().context().envKeys; }
 ipcMain.handle('keys:get', () => {
   const result = credentialStore().list();
@@ -967,6 +969,8 @@ ipcMain.handle('keys:get', () => {
 });
 ipcMain.handle('keys:retry', () => credentialStore().initialize());
 ipcMain.handle('settings:reveal', () => { try { shell.showItemInFolder(path.join(app.getPath('userData'), 'credentials.json')); } catch (_) {} });
+// Where a "settings.json is unreadable" error sends the user to fix the file.
+ipcMain.handle('settings:revealFile', () => { try { shell.showItemInFolder(settingsFile()); } catch (_) {} });
 ipcMain.handle('keys:set', (_e, args) => credentialStore().set(args?.name, args?.value));
 ipcMain.handle('keys:delete', (_e, args) => credentialStore().remove(args?.name));
 ipcMain.handle('keys:reveal', (_e, args) => credentialStore().reveal(args?.name));
@@ -1286,23 +1290,14 @@ ipcMain.handle('clipboard:read', () => { try { return clipboard.readText(); } ca
 // ---- IPC: dictation → text -------------------------------------------------
 // Which engine runs is stt.js's problem; this only supplies config and a way to
 // report download progress back to the window that asked.
-function sttEnv() {
-  if (!credentialStore().status().ok) {
-    const settings = readSettings();
-    if (!settings.sttProvider || settings.sttProvider === 'local') return { settings: { ...settings, sttProvider: 'local' }, env: {} };
-  }
-  return { settings: credentialSettings(), env: process.env };
-}
+// credentialSettings() carries no saved keys while the store is unavailable, so
+// a key exported in the shell still works and the local engine is unaffected.
+function sttEnv() { return { settings: credentialSettings(), env: process.env }; }
 function sttStatus() {
-  try { return stt.status(sttEnv()); }
-  catch (_) {
-    const status = stt.status({ settings: readSettings(), env: {} });
-    for (const provider of status.providers) if (provider.needsKey) {
-      provider.ready = false;
-      provider.reason = 'Saved keys unavailable. Open Settings → Keys to retry.';
-    }
-    return { ...status, credentialStorage: credentialStore().status() };
-  }
+  const status = stt.status(sttEnv());
+  const storage = credentialStore().status();
+  // Lets the Voice pane say why a keyed provider is not ready.
+  return storage.ok ? status : { ...status, credentialStorage: storage };
 }
 
 // Whisper weights live in one writable folder under userData. A packaged build
@@ -1323,9 +1318,17 @@ function sttModelDir() {
 
 async function runSpeech(e, operation, clip) {
   try {
-    return await stt[operation]({ ...sttEnv(), clip,
+    const env = sttEnv();
+    const result = await stt[operation]({ ...env, clip,
       deps: { onProgress: p => sendWc(e.sender, 'stt:progress', p) } });
-  } catch (_) { return { ok: false, error: credentialStore().status().ok ? 'Could not complete the speech request.' : CREDENTIAL_ERROR }; }
+    // A keyed provider with no key, while saved keys cannot be read: name the
+    // real cause instead of "no API key".
+    if (result && result.ok === false && !credentialStore().status().ok) {
+      const provider = stt.resolveProvider(env.settings, env.env);
+      if (provider && provider.needsKey && !stt.sttConfig(env.settings, env.env)[provider.needsKey]) return { ...result, error: CREDENTIAL_ERROR };
+    }
+    return result;
+  } catch (_) { return { ok: false, error: 'Could not complete the speech request.' }; }
 }
 ipcMain.handle('stt:transcribe', (e, clip) => runSpeech(e, 'transcribe', clip));
 ipcMain.handle('stt:status', () => sttStatus());
@@ -1434,6 +1437,9 @@ ipcMain.handle('term:create', async (e, { id, cwd, cols, rows, kind, command, pr
     file = shellPath;
   }
 
+  // Sessions start without saved keys when the store is unavailable; say so once,
+  // so an agent that then asks for a key is not a mystery.
+  if (!credentialStore().status().ok) sendWc(wc, 'term:data', { id, data: '\x1b[2m[saved keys unavailable — open Settings → Keys]\x1b[0m\r\n' });
   let p;
   try {
     p = pty.spawn(file, spawnArgs, {

@@ -48,6 +48,7 @@ so the shipped app can transcribe offline. Packaging config lives in
 - `src/main/main.js` — Electron main: window, PTYs, folder + `.claude` scan, state, IPC
 - `src/main/claude-driver.js` — one Claude Code session → paper-card events
 - `src/main/settings.js` — settings.json, read-merge-rename so writers can't clobber
+- `src/main/credential-store.js` — saved API keys, safeStorage-encrypted in credentials.json, and their migration
 - `src/main/stt.js` — transcription providers as one registry (local, openai, elevenlabs, custom)
 - `src/main/stt-local.js` / `stt-model.js` — Whisper on onnxruntime-node, and its weights
 - `src/main/preload.js` — contextBridge IPC surface
