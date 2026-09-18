@@ -10,7 +10,7 @@ import * as settingsStore from '../src/main/settings.js';
 import { stripInheritedClaude } from '../src/main/session-env.js';
 import { agentStatus as probeAgentStatus } from '../src/main/agents-detect.js';
 import { sttConfig } from '../src/main/stt.js';
-import { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR } from '../src/main/credential-store.js';
+import { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR, CLEANUP_ERROR } from '../src/main/credential-store.js';
 const envOnly='environment-only-dummy';
 // Mirrors stt.js closely enough for main.js: a keyed provider is ready only when
 // sttConfig finds a key in saved settings or the environment.
@@ -53,14 +53,15 @@ for(const available of [true,false]) test(`IPC responses contain no secrets with
   if(available) assert.equal(revealed.value,h.secret);
   else assert.equal(JSON.parse(fs.readFileSync(path.join(h.dir,'settings.json'),'utf8')).openaiKey,h.secret);
 });
-test('legacy settings writes go to encrypted storage and malformed sources are preserved',t=>{
+test('legacy settings writes go to encrypted storage; a completed profile self-heals bad preferences',t=>{
   const h=harness(t,true), handler=h.handlers.get('settings:set');
   assert.equal(handler({},{elevenKey:h.secret}).ok,true);
   assert.ok(!fs.readFileSync(path.join(h.dir,'settings.json'),'utf8').includes(h.secret));
   assert.equal(h.handlers.get('keys:reveal')({},{name:'legacy:elevenKey'}).value,h.secret);
+  // Migration is complete, so a damaged preferences file is simply replaced.
   fs.writeFileSync(path.join(h.dir,'settings.json'),'invalid original');
-  assert.equal(handler({},{theme:'paper'}).ok,false);
-  assert.equal(fs.readFileSync(path.join(h.dir,'settings.json'),'utf8'),'invalid original');
+  assert.equal(handler({},{theme:'paper'}).ok,true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(h.dir,'settings.json'),'utf8')),{theme:'paper'});
 });
 test('malformed key IPC payloads return validation errors without disabling storage', t => {
   const h = harness(t, true);
@@ -115,15 +116,29 @@ test('unavailable storage disables only saved keys: sessions, agent status, shel
   fs.writeFileSync(settingsFile, JSON.stringify({ ...kept, sttProvider: 'local' }));
   assert.equal((await h.handlers.get('stt:transcribe')({}, {})).ok, true);
 });
-test('an unreadable settings.json is reported as such and is never overwritten', t => {
+test('an unreadable settings.json is replaced by a preference write once migration is complete', t => {
   const h = harness(t, true), settingsFile = path.join(h.dir, 'settings.json');
-  fs.writeFileSync(settingsFile, 'invalid original');
-  const refused = h.handlers.get('theme:set')({}, 'dusk');
-  assert.equal(refused.ok, false); assert.equal(refused.error, SETTINGS_ERROR);
-  assert.equal(fs.readFileSync(settingsFile, 'utf8'), 'invalid original');
-  // The migrated vault does not depend on it.
+  for (const broken of ['invalid original', '', '[]']) {
+    fs.writeFileSync(settingsFile, broken);
+    const saved = h.handlers.get('theme:set')({}, 'dusk');
+    assert.equal(saved.ok, true, JSON.stringify(broken));
+    assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { theme: 'dusk' });
+  }
+  // The migrated vault does not depend on it either way.
+  fs.writeFileSync(settingsFile, 'invalid again');
   assert.equal(h.handlers.get('keys:reveal')({}, { name: 'OPENAI_API_KEY' }).value, h.secret);
   assert.equal(h.handlers.get('keys:set')({}, { name: 'NEW_KEY', value: h.secret }).ok, true);
+  assert.equal(fs.readFileSync(settingsFile, 'utf8'), 'invalid again');
+  assert.equal(h.handlers.get('view:set')({}, 'split').ok, true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { view: 'split' });
+});
+test('an unreadable settings.json is never overwritten while it is still a migration source', t => {
+  const h = harness(t, false), settingsFile = path.join(h.dir, 'settings.json');
+  fs.writeFileSync(settingsFile, 'invalid original');
+  for (const [channel, arg] of [['theme:set', 'dusk'], ['view:set', 'split'], ['settings:set', { openaiModel: 'whisper-1' }]]) {
+    const refused = h.handlers.get(channel)({}, arg);
+    assert.equal(refused.ok, false, channel); assert.equal(refused.error, SETTINGS_ERROR, channel);
+  }
   assert.equal(fs.readFileSync(settingsFile, 'utf8'), 'invalid original');
 });
 test('production speech and agent lookup preserve precedence without persisting environment keys', t => {
@@ -166,4 +181,45 @@ test('cleanup status reaches key IPC without leaking source or disabling committ
   assert.deepEqual(JSON.parse(fs.readFileSync(file,'utf8')),{theme:'dusk'});
   const legacy=h.handlers.get('settings:set')({},{elevenKey:h.secret});
   assert.equal(legacy.cleanupPending,false); assert.equal(legacy.cleanupWarning,null);
+});
+
+test('a migration blocked by settings.json tells the Keys pane and dictation about settings.json', async t => {
+  const h = harness(t, true), settingsFile = path.join(h.dir, 'settings.json');
+  // Fresh profile whose settings.json cannot be rewritten: the source lives in a
+  // read-only folder behind a symlink, which the private writer follows.
+  fs.rmSync(path.join(h.dir, 'credentials.json'));
+  const ro = path.join(h.dir, 'ro'); fs.mkdirSync(ro);
+  fs.writeFileSync(path.join(ro, 'settings.json'), JSON.stringify({ sttProvider: 'openai', envKeys: { OPENAI_API_KEY: h.secret } }));
+  fs.chmodSync(ro, 0o500); t.after(() => { try { fs.chmodSync(ro, 0o700); } catch (_) {} });
+  fs.rmSync(settingsFile); fs.symlinkSync(path.join(ro, 'settings.json'), settingsFile);
+  vm.runInContext('credentials = undefined; delete process.env.OPENAI_API_KEY', h.ctx);
+  const init = vm.runInContext('credentialStore().initialize()', h.ctx);
+  assert.equal(init.ok, false); assert.equal(init.error, CLEANUP_ERROR);
+  assert.equal(h.handlers.get('keys:get')({}).kind, 'settings');
+  assert.equal(h.handlers.get('keys:retry')({}).error, CLEANUP_ERROR);
+  for (const channel of ['stt:transcribe', 'stt:prepare']) {
+    const failed = await h.handlers.get(channel)({}, {});
+    assert.equal(failed.ok, false); assert.equal(failed.error, CLEANUP_ERROR, channel);
+  }
+  assert.equal(h.handlers.get('stt:status')({}).credentialStorage.kind, 'settings');
+  assert.equal(JSON.parse(fs.readFileSync(settingsFile, 'utf8')).envKeys.OPENAI_API_KEY, h.secret);
+  // Fixing the folder and retrying finishes the migration.
+  fs.chmodSync(ro, 0o700);
+  assert.equal(h.handlers.get('keys:retry')({}).ok, true);
+  assert.equal(h.handlers.get('keys:reveal')({}, { name: 'OPENAI_API_KEY' }).value, h.secret);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { sttProvider: 'openai' });
+  assert.equal((await h.handlers.get('stt:transcribe')({}, {})).ok, true);
+});
+test('keys:retry on a usable store retries cleanup without the key store and reports skipped entries', t => {
+  const h = harness(t, true), settingsFile = path.join(h.dir, 'settings.json');
+  fs.writeFileSync(settingsFile, JSON.stringify({ theme: 'dusk', envKeys: { OPENAI_API_KEY: h.secret, 'bad-name': 'skipped-dummy' } }));
+  vm.runInContext('safeStorage.isEncryptionAvailable = () => false', h.ctx);
+  const retried = h.handlers.get('keys:retry')({});
+  assert.equal(retried.ok, true); assert.equal(retried.cleanupPending, false);
+  assert.deepEqual(retried.skippedKeys, ['bad-name']);
+  assert.ok(retried.skippedWarning.includes('bad-name'));
+  assert.ok(!JSON.stringify(retried).includes('skipped-dummy') && !JSON.stringify(retried).includes(h.secret));
+  assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile, 'utf8')), { theme: 'dusk', envKeys: { 'bad-name': 'skipped-dummy' } });
+  assert.equal(h.handlers.get('keys:reveal')({}, { name: 'OPENAI_API_KEY' }).value, h.secret);
+  assert.ok(!JSON.stringify(h.handlers.get('settings:get')({})).includes('skipped-dummy'));
 });

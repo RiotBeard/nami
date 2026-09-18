@@ -35,7 +35,7 @@ const { createDirWatch } = require('./dir-watch');
 const { fmtSize, listDirectory, readTree } = require('./workspace-tree');
 const { ptyCwd } = require('./pty-cwd');
 const settingsStore = require('./settings');
-const { createCredentialStore, preferences, LEGACY, ERROR: CREDENTIAL_ERROR, SETTINGS_ERROR } = require('./credential-store');
+const { createCredentialStore, preferences, LEGACY, SETTINGS_ERROR } = require('./credential-store');
 const { migrateRecents, sortRecents, rememberFolderIn, setPinnedIn, removeFrom } = require('./recents');
 const { windowChrome } = require('./platform');
 const { seedStartHere } = require('./start-here');
@@ -176,13 +176,10 @@ function credentialStore() {
 }
 function readSettings() { return preferences(settingsStore.readSettings({ file: settingsFile() })); }
 function writeSettings(patch) {
-  // Do not replace an unreadable migration source through the preferences path.
-  try {
-    if (fs.existsSync(settingsFile())) {
-      const doc = JSON.parse(fs.readFileSync(settingsFile(), 'utf8'));
-      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error();
-    }
-  } catch (_) { return { ok: false, error: SETTINGS_ERROR }; }
+  // Until migration is known to be complete, settings.json may still hold keys
+  // to import, so an unreadable one is never replaced through the preferences
+  // path. Afterwards it holds only preferences and a bad file self-heals.
+  if (credentialStore().status().migration !== 'complete' && !credentialStore().settingsReadable()) return { ok: false, error: SETTINGS_ERROR };
   let cleanup = {};
   if (LEGACY.some(k => Object.prototype.hasOwnProperty.call(patch, k))) {
     const result = credentialStore().setLegacy(patch);
@@ -969,7 +966,7 @@ ipcMain.handle('keys:get', () => {
   const result = credentialStore().list();
   return { stored: [], legacy: [], ...result };
 });
-ipcMain.handle('keys:retry', () => credentialStore().initialize());
+ipcMain.handle('keys:retry', () => credentialStore().retry());
 ipcMain.handle('settings:reveal', () => { try { shell.showItemInFolder(path.join(app.getPath('userData'), 'credentials.json')); } catch (_) {} });
 // Where a "settings.json is unreadable" error sends the user to fix the file.
 ipcMain.handle('settings:revealFile', () => { try { shell.showItemInFolder(settingsFile()); } catch (_) {} });
@@ -1324,10 +1321,11 @@ async function runSpeech(e, operation, clip) {
     const result = await stt[operation]({ ...env, clip,
       deps: { onProgress: p => sendWc(e.sender, 'stt:progress', p) } });
     // A keyed provider with no key, while saved keys cannot be read: name the
-    // real cause instead of "no API key".
-    if (result && result.ok === false && !credentialStore().status().ok) {
+    // real cause (key store, settings.json) instead of "no API key".
+    const storage = credentialStore().status();
+    if (result && result.ok === false && !storage.ok) {
       const provider = stt.resolveProvider(env.settings, env.env);
-      if (provider && provider.needsKey && !stt.sttConfig(env.settings, env.env)[provider.needsKey]) return { ...result, error: CREDENTIAL_ERROR };
+      if (provider && provider.needsKey && !stt.sttConfig(env.settings, env.env)[provider.needsKey]) return { ...result, error: storage.error };
     }
     return result;
   } catch (_) { return { ok: false, error: 'Could not complete the speech request.' }; }

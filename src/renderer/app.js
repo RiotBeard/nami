@@ -187,7 +187,9 @@ function setView(name, persistIt = true) {
   const was = S.view;
   S.view = view;
   if (persistIt && !S.demo && !S.review) { try { localStorage.setItem(VIEW_KEY, view); } catch (_) {} }
-  if (persistIt && !S.demo && !S.review && api.viewSet) api.viewSet(view);
+  if (persistIt && !S.demo && !S.review && api.viewSet) {
+    Promise.resolve(api.viewSet(view)).then((r) => { if (r && r.ok === false && r.error) toast(`View changed, but could not be saved: ${r.error}`); }).catch(() => {});
+  }
   if (view === 'split' && was !== 'split') S.split = splitAfter({ ...S.split, panels: S.panels }, { type: 'enter', activeId: S.activeId });
   if (view !== 'split') S.expandedId = null;
   applyViewAttrs();
@@ -205,9 +207,9 @@ function setTheme(name, persistIt = true) {
   let saved = Promise.resolve();
   if (persistIt && !S.review && api.themeSet) {
     saved = Promise.resolve(api.themeSet(name)).then((result) => {
-      if (!result || !result.ok) throw new Error('save failed');
+      if (!result || !result.ok) throw new Error((result && result.error) || 'save failed');
       if (version === themeSaveVersion) { try { localStorage.setItem(THEME_KEY, name); } catch (_) {} }
-    }).catch(() => toast('Appearance changed, but could not be saved for next launch.'));
+    }).catch((e) => toast('Appearance changed, but could not be saved for next launch.' + (e && e.message && e.message !== 'save failed' ? ` ${e.message}` : '')));
   }
   tileEls.forEach((t, id) => {
     if (!t.term) return;
@@ -6170,6 +6172,7 @@ function keysPaneHtml() {
   return `<p class="setup-copy">Paste a key once and it lands in the environment of every session Nami
     starts — agents, terminals, harnesses. Voice reads the same keys.</p>
     ${o.keys.cleanupPending ? `<div id="keys-cleanup-warning" role="alert"><p class="setup-copy">${esc(o.keys.cleanupWarning)}</p><button class="btn" id="keys-retry">Retry cleanup</button> <button class="btn" id="keys-show-settings">Show settings.json</button></div>` : ''}
+    ${!o.keys.cleanupPending && o.keys.skippedKeys && o.keys.skippedKeys.length ? `<div id="keys-skipped-warning" role="alert"><p class="setup-copy">${esc(o.keys.skippedWarning || '')}</p><button class="btn" id="keys-retry">Check again</button> <button class="btn" id="keys-show-settings">Show settings.json</button></div>` : ''}
     ${rows.join('')}
     ${(o.keys.legacy || []).map(k => keyRowHtml({ name: k.name, value: o.reveal?.name === k.name ? o.reveal.value : k.masked, actions: [o.reveal?.name === k.name ? 'hide' : 'show', 'remove'] })).join('')}
     <div class="key-row key-row--new">
@@ -6187,7 +6190,12 @@ function wireKeysPane(modal) {
   const o = S.overlay;
   if (o.keys === undefined) { o.keys = null; refreshKeys(); }
   const retry = q('#keys-retry', modal);
-  if (retry) retry.onclick = async () => { const result = await api.keysRetry(); if (!result.ok) toast(result.error); refreshKeys(); refreshSttInfo(); };
+  if (retry) retry.onclick = async () => {
+    const result = await api.keysRetry();
+    if (!result.ok) toast(result.error);
+    else if (result.cleanupPending) toast(result.cleanupWarning);
+    refreshKeys(); refreshSttInfo();
+  };
   const showSettings = q('#keys-show-settings', modal);
   if (showSettings) showSettings.onclick = () => api.settingsRevealFile();
   const saveKey = async (name, input) => {
