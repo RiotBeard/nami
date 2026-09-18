@@ -183,12 +183,14 @@ function writeSettings(patch) {
       if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new Error();
     }
   } catch (_) { return { ok: false, error: SETTINGS_ERROR }; }
+  let cleanup = {};
   if (LEGACY.some(k => Object.prototype.hasOwnProperty.call(patch, k))) {
     const result = credentialStore().setLegacy(patch);
     if (!result.ok) return result;
+    cleanup = { cleanupPending: result.cleanupPending, cleanupWarning: result.cleanupWarning };
   }
   const result = settingsStore.writeSettings({ file: settingsFile(), patch: preferences(patch) });
-  return result.ok ? { ok: true } : { ok: false, error: 'Could not save preferences.' };
+  return result.ok ? { ok: true, ...cleanup } : { ok: false, error: 'Could not save preferences.', ...cleanup };
 }
 function credentialSettings() { return { ...readSettings(), ...credentialStore().context() }; }
 
@@ -979,7 +981,7 @@ ipcMain.handle('settings:set', (_e, patch) => {
   for (const [k, v] of Object.entries(patch || {})) if (WRITABLE_SETTINGS.has(k)) clean[k] = v;
   if (REVIEW) { delete clean.theme; delete clean.view; }
   const res = writeSettings(clean);
-  return res.ok ? { ok: true, sttInfo: sttStatus() } : res;
+  return res.ok ? { ...res, sttInfo: sttStatus() } : res;
 });
 
 ipcMain.handle('folder:pick', async (e) => {

@@ -6169,6 +6169,7 @@ function keysPaneHtml() {
   }
   return `<p class="setup-copy">Paste a key once and it lands in the environment of every session Nami
     starts — agents, terminals, harnesses. Voice reads the same keys.</p>
+    ${o.keys.cleanupPending ? `<div id="keys-cleanup-warning" role="alert"><p class="setup-copy">${esc(o.keys.cleanupWarning)}</p><button class="btn" id="keys-retry">Retry cleanup</button> <button class="btn" id="keys-show-settings">Show settings.json</button></div>` : ''}
     ${rows.join('')}
     ${(o.keys.legacy || []).map(k => keyRowHtml({ name: k.name, value: o.reveal?.name === k.name ? o.reveal.value : k.masked, actions: [o.reveal?.name === k.name ? 'hide' : 'show', 'remove'] })).join('')}
     <div class="key-row key-row--new">
@@ -6186,7 +6187,7 @@ function wireKeysPane(modal) {
   const o = S.overlay;
   if (o.keys === undefined) { o.keys = null; refreshKeys(); }
   const retry = q('#keys-retry', modal);
-  if (retry) retry.onclick = async () => { await api.keysRetry(); refreshKeys(); refreshSttInfo(); };
+  if (retry) retry.onclick = async () => { const result = await api.keysRetry(); if (!result.ok) toast(result.error); refreshKeys(); refreshSttInfo(); };
   const showSettings = q('#keys-show-settings', modal);
   if (showSettings) showSettings.onclick = () => api.settingsRevealFile();
   const saveKey = async (name, input) => {
@@ -6207,7 +6208,7 @@ function wireKeysPane(modal) {
       else if (act === 'cancel') { o.editKey = null; renderOverlay(); }
       else if (act === 'show') { const r = await api.keysReveal(name); if (!r.ok) { toast(r.error); refreshKeys(); return; } o.reveal = { name, value: r.value }; renderOverlay(); }
       else if (act === 'hide') { o.reveal = null; renderOverlay(); }
-      else if (act === 'remove') { o.reveal = null; const result = await api.keysDelete(name); if (!result.ok) { toast(result.error); refreshKeys(); return; } toast(`${name} removed.`); refreshKeys(); refreshSttInfo(); }
+      else if (act === 'remove') { o.reveal = null; const result = await api.keysDelete(name); if (!result.ok) { toast(result.error); refreshKeys(); return; } toast(result.cleanupPending ? 'Removed from encrypted storage; plaintext cleanup is incomplete' : `${name} removed.`); refreshKeys(); refreshSttInfo(); }
     };
   });
   const editInput = q('#key-edit-val', modal);

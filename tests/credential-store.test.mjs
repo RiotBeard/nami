@@ -4,10 +4,16 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR } from '../src/main/credential-store.js';
+import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, SOURCE_CHANGED_ERROR } from '../src/main/credential-store.js';
 import { writeSettings } from '../src/main/settings.js';
 import { sttConfig } from '../src/main/stt.js';
 const secret = ['dummy','value','987654321'].join('-');
+function assertFailure(result, error) {
+  assert.equal(result.ok, false);
+  assert.equal(result.error, error);
+  assert.equal(typeof result.cleanupPending, 'boolean');
+  assert.ok(result.cleanupWarning === null || result.cleanupWarning === CLEANUP_WARNING);
+}
 function fixture(source = {}) {
   const files = new Map([['settings', JSON.stringify(source)]]), writes = [];
   const key = crypto.randomBytes(32);
@@ -48,7 +54,7 @@ for (const failAt of [1,2,3]) test(`migration recovers after failure at write ${
   const f = fixture({ envKeys: { TEST_KEY: secret }, theme: 'glass' });
   const original = f.io.write; let count = 0;
   f.io.write = (file,text) => { if (++count === failAt) throw new Error(secret); original(file,text); };
-  const s = f.make(); assert.deepEqual(s.initialize(), { ok: false, error: ERROR });
+  const s = f.make(); assertFailure(s.initialize(), ERROR);
   assert.deepEqual(s.context(), { envKeys: {} }); // reads never throw
   f.io.write = original;
   const restarted = f.make(); assert.equal(restarted.initialize().ok, true);
@@ -103,7 +109,7 @@ test('unknown versions, malformed settings and failed updates preserve data and 
   f.files.delete('vault'); f.files.set('settings','broken'); assert.equal(f.make().initialize().ok,false);
   f.files.set('settings','{}'); const s=f.make(); s.initialize(); s.set('KEY',secret);
   const before=f.files.get('vault'); f.encryption.encryptString=()=>{throw new Error(secret);};
-  assert.deepEqual(s.set('KEY','new'),{ok:false,error:ERROR}); assert.equal(f.files.get('vault'),before);
+  assertFailure(s.set('KEY','new'), ERROR); assert.equal(f.files.get('vault'),before);
   assert.ok(!JSON.stringify(s.list()).includes(secret));
 });
 test('real private writer uses owner-only atomic files with encrypted content', t => {
@@ -209,7 +215,7 @@ test('an unavailable store yields no saved keys and never throws on reads', () =
   assert.deepEqual(store.context(), { envKeys: {} }); // before initialize
   assert.equal(store.initialize().ok, false);
   assert.deepEqual(store.context(), { envKeys: {} });
-  assert.deepEqual(store.status(), { ok: false, error: ERROR, kind: 'storage' });
+  assert.deepEqual(store.status(), { ok: false, error: ERROR, kind: 'storage', cleanupPending: false, cleanupWarning: null });
   assert.equal(store.list().ok, false);
   assert.equal(store.reveal('OPENAI_API_KEY').ok, false);
 });
@@ -218,11 +224,11 @@ test('a failed save keeps the verified keys readable instead of locking the stor
   const before = f.files.get('vault'), write = f.io.write, encrypt = f.encryption.encryptString;
   // Fails before anything is written.
   f.encryption.encryptString = () => { throw new Error('encrypt'); };
-  assert.deepEqual(store.set('OTHER', 'other-dummy-value'), { ok: false, error: ERROR });
+  assertFailure(store.set('OTHER', 'other-dummy-value'), ERROR);
   f.encryption.encryptString = encrypt;
   // Fails at the write itself: the atomic rename never happened.
   f.io.write = () => { throw new Error('disk full'); };
-  assert.deepEqual(store.remove('KEY'), { ok: false, error: ERROR });
+  assertFailure(store.remove('KEY'), ERROR);
   f.io.write = write;
   assert.equal(f.files.get('vault'), before);
   assert.equal(store.status().ok, true);
@@ -270,7 +276,7 @@ test('a pending migration with an unreadable or malformed source fails closed an
   for (const source of ['not json', '[]', JSON.stringify({ envKeys: { 'bad-name': secret } }), JSON.stringify({ openaiKey: 12 })]) {
     const f = fixture(); f.files.set('settings', source);
     const store = f.make();
-    assert.deepEqual(store.initialize(), { ok: false, error: SETTINGS_ERROR });
+    assertFailure(store.initialize(), SETTINGS_ERROR);
     assert.equal(store.status().kind, 'settings');
     assert.equal(store.list().kind, 'settings');
     assert.equal(f.files.get('settings'), source);
@@ -287,4 +293,102 @@ test('settings cleanup failing after a committed save does not fail the save', (
   f.io.write = write;
   assert.equal(store.set('KEY2', secret).ok, true); // cleanup is retried
   assert.deepEqual(JSON.parse(f.files.get('settings')), { theme: 'dusk' });
+});
+
+for (const operation of ['save', 'delete']) test(`${operation} commits despite cleanup failure, warns across restart, and recovers`, () => {
+  const f=fixture({envKeys:{OPENAI_API_KEY:secret},openaiKey:secret}), s=f.make();
+  s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{OPENAI_API_KEY:secret},openaiKey:secret,theme:'dusk'}));
+  const write=f.io.write;
+  f.io.write=(file,text)=>{if(file==='settings') throw Error(secret); write(file,text);};
+  const res=operation==='save'?s.set('OTHER',secret):s.remove('OPENAI_API_KEY');
+  assert.equal(res.ok,true); assert.equal(res.cleanupPending,true); assert.equal(res.cleanupWarning,CLEANUP_WARNING);
+  assert.equal(s.status().ok,true); assert.equal(s.list().cleanupPending,true);
+  assert.equal(s.reveal(operation==='save'?'OTHER':'OPENAI_API_KEY').value,operation==='save'?secret:'');
+  if(operation==='delete') assert.equal(s.context().openaiKey,undefined);
+  const restarted=f.make(), init=restarted.initialize();
+  assert.equal(init.ok,true); assert.equal(init.cleanupPending,true);
+  assert.equal(restarted.reveal(operation==='save'?'OTHER':'OPENAI_API_KEY').value,operation==='save'?secret:'');
+  for(const response of [res,init,s.status(),s.list()]) assert.ok(!JSON.stringify(response).includes(secret));
+  f.io.write=write;
+  assert.equal(restarted.initialize().cleanupPending,false);
+  assert.equal(restarted.status().cleanupWarning,null);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'dusk'});
+});
+test('cleanup validates its exact snapshot, preserves a newly added key, and imports it on retry',()=>{
+  const f=fixture({envKeys:{FIRST:secret},theme:'paper'}), read=f.io.read;
+  let reads=0;
+  f.io.read=file=>{
+    if(file==='settings' && ++reads===2) f.files.set(file,JSON.stringify({envKeys:{FIRST:secret,LATE:'dummy-late'},theme:'dusk'}));
+    return read(file);
+  };
+  const s=f.make(), result=s.initialize();
+  assert.equal(result.ok,false); assert.equal(result.error,SOURCE_CHANGED_ERROR);
+  assert.equal(JSON.parse(f.files.get('settings')).envKeys.LATE,'dummy-late');
+  assert.deepEqual(s.context(),{envKeys:{}});
+  assert.equal(s.initialize().ok,true);
+  assert.equal(s.reveal('LATE').value,'dummy-late');
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'dusk'});
+});
+test('cleanup writes the validated snapshot without an intervening read and keeps fresh preferences',()=>{
+  const f=fixture({envKeys:{FIRST:secret},theme:'paper'}), read=f.io.read, write=f.io.write;
+  let reads=0, wrote=false;
+  f.io.read=file=>{
+    if(file==='settings') {
+      ++reads;
+      if(reads===2) f.files.set(file,JSON.stringify({envKeys:{FIRST:secret},theme:'dusk',view:'split'}));
+      if(reads===3) assert.equal(wrote,true,'third read must only verify after cleanup writes');
+    }
+    return read(file);
+  };
+  f.io.write=(file,text)=>{if(file==='settings'){assert.equal(reads,2);wrote=true;}write(file,text);};
+  assert.equal(f.make().initialize().ok,true);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'dusk',view:'split'});
+});
+test('unreadable completed settings warn without disabling keys; retry confirms absence',()=>{
+  const f=fixture({envKeys:{KEY:secret}}), s=f.make(); s.initialize();
+  f.files.set('settings','unreadable fixture');
+  const restarted=f.make();
+  assert.equal(restarted.initialize().cleanupPending,true);
+  assert.equal(restarted.set('NEW',secret).cleanupPending,true);
+  assert.equal(restarted.reveal('KEY').value,secret);
+  assert.equal(f.files.get('settings'),'unreadable fixture');
+  f.files.set('settings',JSON.stringify({theme:'glass'}));
+  assert.equal(restarted.initialize().cleanupPending,false);
+});
+
+test('cleanup warning does not clear until read-back confirms plaintext is absent',()=>{
+  const f=fixture({envKeys:{KEY:secret}}), s=f.make(); s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:secret}}));
+  const write=f.io.write;
+  f.io.write=(file,text)=>{if(file!=='settings')write(file,text);};
+  assert.equal(s.set('OTHER',secret).cleanupPending,true);
+  assert.equal(s.status().ok,true);
+  f.io.write=write;
+  assert.equal(s.set('OTHER',secret).cleanupPending,false);
+  assert.equal(f.files.get('settings').includes(secret),false);
+});
+
+test('retry while protection is unavailable preserves verified keys and pending cleanup', () => {
+  const f = fixture({envKeys:{KEY:secret}}), store = f.make();
+  store.initialize();
+  f.files.set('settings', 'unreadable fixture');
+  assert.equal(store.initialize().cleanupPending, true);
+  const before = f.files.get('vault'), writes = f.writes.length;
+  f.encryption.isEncryptionAvailable = () => false;
+  const retried = store.initialize();
+  assertFailure(retried, ERROR);
+  assert.equal(retried.cleanupPending, true);
+  assert.equal(store.status().ok, true);
+  assert.equal(store.context().envKeys.KEY, secret);
+  assert.equal(store.reveal('KEY').value, secret);
+  assert.equal(store.set('OTHER', secret).ok, false);
+  assert.equal(f.files.get('vault'), before);
+  assert.equal(f.writes.length, writes);
+  // No cached state in a fresh process: encrypted keys remain unavailable.
+  assert.equal(f.make().initialize().ok, false);
+  f.encryption.isEncryptionAvailable = () => true;
+  f.files.set('settings', JSON.stringify({envKeys:{KEY:secret},theme:'paper'}));
+  assert.equal(store.initialize().cleanupPending, false);
+  assert.deepEqual(JSON.parse(f.files.get('settings')), {theme:'paper'});
 });

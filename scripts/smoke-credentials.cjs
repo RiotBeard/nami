@@ -102,8 +102,7 @@ async function launch(check) {
     await launch(async run=>{
       assert.equal((await run('dainami.keysGet()')).ok,false);
       assert.equal((await run('dainami.keysSet("BLOCKED_KEY","dummy")')).ok,false);
-      // Only saved keys are affected: agent status keeps its shape and speech status still resolves.
-      assert.ok('signedIn' in (await run('dainami.agentStatus("claude")')),'agent status shape with damaged vault');
+      // Agent account probes are covered offline with injected dependencies.
       const speech=await run('dainami.sttStatus()');
       assert.ok(Array.isArray(speech.providers)&&speech.credentialStorage&&speech.credentialStorage.ok===false,'speech status with damaged vault');
       await until(()=>run('!!document.querySelector("#btn-settings")'),'Settings button');
@@ -126,8 +125,31 @@ async function launch(check) {
       await run('document.querySelector("#keys-retry").click()');
       await until(()=>run('!!document.querySelector("#key-new-save")'),'Retry after failed save recovers');
       assert.equal((await run('dainami.keysReveal("FAILED_SAVE")')).value,'');
+      // A completed vault stays usable when disposable settings cannot be parsed.
+      const settingsFile=path.join(profile,'settings.json');
+      fs.writeFileSync(settingsFile,'unreadable settings fixture');
+      await run(`document.querySelector('#key-new-name').value='CLEANUP_KEY'; document.querySelector('#key-new-val').value=${JSON.stringify(saved)}; document.querySelector('#key-new-save').click()`);
+      await until(()=>run('!!document.querySelector("#keys-cleanup-warning")'),'cleanup warning after committed save');
+      const warned=await run('dainami.keysGet()');
+      assert.equal(warned.ok,true); assert.equal(warned.cleanupPending,true);
+      assert.ok(!JSON.stringify(warned).includes(saved));
+      assert.equal((await run('dainami.keysReveal("CLEANUP_KEY")')).value,saved);
+      assert.equal(await run('document.querySelector("#keys-retry").textContent'),'Retry cleanup');
+      assert.ok(await run('!!document.querySelector("#keys-show-settings") && !!document.querySelector("#key-new-save")'));
+      await run(`document.querySelector('[data-key="CLEANUP_KEY"] [data-act="remove"]').click()`);
+      await until(()=>run('document.querySelector("#toast-root").textContent.includes("Removed from encrypted storage; plaintext cleanup is incomplete")'),'truthful deletion notification');
+      assert.equal((await run('dainami.keysReveal("CLEANUP_KEY")')).value,'');
+      assert.equal(fs.readFileSync(settingsFile,'utf8'),'unreadable settings fixture');
+      fs.writeFileSync(settingsFile,JSON.stringify({theme:'dusk',envKeys:{CLEANUP_KEY:saved}}));
+      await run('document.querySelector("#keys-retry").click()');
+      await until(()=>run('!document.querySelector("#keys-cleanup-warning") && !!document.querySelector("#key-new-save")'),'cleanup retry clears warning');
+      const cleaned=await run('dainami.keysGet()');
+      assert.equal(cleaned.cleanupPending,false); assert.equal(cleaned.cleanupWarning,null);
+      assert.equal((await run('dainami.keysReveal("CLEANUP_KEY")')).value,'');
+      assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile,'utf8')),{theme:'dusk'});
+
     });
-    console.log('PASS: corrupt vault preserved, saves blocked, Settings Retry recovers restored ciphertext');
+    console.log('PASS: corrupt vault recovery; incomplete cleanup warns with usable keys; deletion notice and Retry cleanup remove stale plaintext');
   } catch(error) {
     // Assertions can contain actual values; keep fixture diagnostics secret-free.
     console.error('FAIL: '+String(error.message).replaceAll(secret,'[redacted]').replaceAll(saved,'[redacted]'));

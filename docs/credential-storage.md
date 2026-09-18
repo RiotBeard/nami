@@ -27,9 +27,12 @@ Environment-only keys are never imported or saved automatically.
 
 The first encrypted commit records imported identifiers, deletion tombstones,
 and a pending migration state. Nami rereads and decrypts that commit and verifies
-its contents before removing plaintext fields. Cleanup rereads settings so other
-preferences survive. A second encrypted commit marks completion. Each transaction
-is synchronous in the main process; handlers in multiple windows cannot interleave.
+its contents before removing plaintext fields. Cleanup reads one settings
+snapshot, validates its key fields against the imported source, then writes sanitized preferences from that exact snapshot. Unrelated
+preference updates in the snapshot survive. A read after replacement confirms
+that active plaintext fields are absent. This removes the extra-read race; it
+does not lock out arbitrary external writers. A second encrypted commit marks
+completion. Each transaction is synchronous in the main process; handlers in multiple windows cannot interleave.
 If an external writer changes source keys during migration, cleanup stops and
 preserves that source for retry. Completed startup validates the vault without
 rewriting it. Run separate development processes with separate profiles, as
@@ -61,12 +64,31 @@ from all keep working; a keyed speech provider with no key anywhere reports that
 saved keys are unavailable instead of "no API key". Reads are served from the
 vault this process last verified, so one failed save (a full disk, a locked key
 store) returns an error for that save and leaves existing keys usable. The store
-becomes unavailable only when the vault on disk no longer verifies.
+becomes unavailable when a vault read no longer verifies. If Retry cannot even
+access system protection, it reports the failed retry without discarding verified
+in-memory keys; a fresh process without cached keys still fails closed.
 
 An unreadable `settings.json` is reported separately, naming the file, with a
 **show settings.json** link in Settings → Keys. Nami never replaces it through a
 preference save. It blocks a migration that has not finished, because the keys
 to import live there, but not a vault that has already been migrated.
+
+Vault availability and plaintext cleanup are reported separately as `ok`,
+`cleanupPending`, and a sanitized `cleanupWarning`. When a save or deletion has
+committed to a completed encrypted vault but cleanup fails, the operation returns
+`ok: true` with the warning. Verified keys remain usable. Settings → Keys keeps
+its normal controls and shows a persistent warning with **Retry cleanup** and
+**Show settings.json**. Deletion explicitly reports “Removed from encrypted
+storage; plaintext cleanup is incomplete”. A completed vault with unreadable
+settings also shows this warning instead of disabling keys.
+
+Cleanup is rechecked at startup, after committed mutations, and through Retry.
+Its status is recomputed from settings on restart; no credential-file format
+change is required. The warning clears only after plaintext fields are confirmed
+absent. Restore settings readability/write access and retry. Initial pending
+migrations still fail closed, and changed source keys produce a recoverable
+source-change error without deleting the new source. Existing encrypted values,
+imported identifiers, and deletion tombstones retain precedence on retry.
 
 Unlock the system key store, resolve permissions or disk-space problems, then
 retry. For damaged ciphertext, quit Nami and restore a known-good encrypted copy
@@ -85,13 +107,20 @@ Do not copy the installed app's settings into a development profile for testing.
 `npm test` runs offline with injected encryption and disposable files; it never
 uses the real Keychain. Coverage includes migration interruption, source retention,
 mixed states, deletions, key precedence, corrupt records, write/encryption errors,
-IPC responses, atomic writes and permissions.
+IPC responses, atomic writes and permissions, cleanup warnings after saves and
+deletions, restart/retry recovery, and changes at the cleanup-read boundary.
+Agent-status IPC tests run the real status parser with injected command execution,
+file reads, home directory and environment; they do not invoke a real account CLI
+or read personal authentication files.
 
 `node scripts/smoke-credentials.cjs` separately launches `npm start` four times
 with a disposable `Nami-dev` profile and dummy secrets. It uses real safeStorage,
 checks migration, Reveal, masking, encrypted persistence and deletion across
 restarts, tests the Settings controls and recovery after damaged ciphertext,
-and then removes the profile. The script opens a localhost debugging
+then exercises incomplete-cleanup warnings with unreadable disposable settings,
+truthful deletion notices, and cleanup retry after restoring the fixture.
+The script does not request live agent-account status and removes the profile
+after testing. It opens a localhost debugging
 endpoint only for these test launches and closes the app processes afterward.
 It may require an OS Keychain prompt. No packaging or installed-app replacement
 is involved. This verifies development-app behavior, not signed-release identity

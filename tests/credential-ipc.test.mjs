@@ -8,6 +8,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import * as settingsStore from '../src/main/settings.js';
 import { stripInheritedClaude } from '../src/main/session-env.js';
+import { agentStatus as probeAgentStatus } from '../src/main/agents-detect.js';
 import { sttConfig } from '../src/main/stt.js';
 import { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR } from '../src/main/credential-store.js';
 const envOnly='environment-only-dummy';
@@ -24,8 +25,14 @@ function harness(t, available) {
   fs.writeFileSync(path.join(dir,'settings.json'),JSON.stringify({envKeys:{OPENAI_API_KEY:secret},openaiKey:secret,theme:'paper'}));
   const key=crypto.randomBytes(32);
   const safeStorage={isEncryptionAvailable:()=>available,encryptString:s=>{const c=crypto.createCipheriv('aes-256-cbc',key,Buffer.alloc(16));return Buffer.concat([c.update(s),c.final()]);},decryptString:b=>{const d=crypto.createDecipheriv('aes-256-cbc',key,Buffer.alloc(16));return Buffer.concat([d.update(b),d.final()]).toString();}};
-  const handlers=new Map();
-  const ctx=vm.createContext({ fs,path,stripInheritedClaude,app:{getPath:()=>dir},settingsStore,createCredentialStore,preferences,LEGACY,safeStorage,ipcMain:{handle:(name,fn)=>handlers.set(name,fn)},REVIEW:false,CREDENTIAL_ERROR:ERROR,process:{env:{PATH:'/usr/bin',OPENAI_API_KEY:envOnly}},SETTINGS_ERROR,stt:speechStub,sendWc(){},agentStatus:async(id,{envKeys})=>({id,signedIn:null,label:'',rows:[],source:'',savedKeyCount:Object.keys(envKeys).length}),shell:{showItemInFolder(){}},refreshAppMenu(){} });
+  const handlers=new Map(), probes=[], reads=[], savedMaps=[];
+  const agentStatus = (id, {envKeys}) => {
+    savedMaps.push(envKeys);
+    return probeAgentStatus(id, {envKeys, home:path.join(dir,'fixture-home'), env:{},
+      exec:async cmd=>{probes.push(cmd); return JSON.stringify({loggedIn:true,email:'fixture@example.invalid',subscriptionType:'max',authMethod:'claude.ai'});},
+      readFile:async file=>{reads.push(file); return null;}});
+  };
+  const ctx=vm.createContext({ fs,path,stripInheritedClaude,app:{getPath:()=>dir},settingsStore,createCredentialStore,preferences,LEGACY,safeStorage,ipcMain:{handle:(name,fn)=>handlers.set(name,fn)},REVIEW:false,CREDENTIAL_ERROR:ERROR,process:{env:{PATH:'/usr/bin',OPENAI_API_KEY:envOnly}},SETTINGS_ERROR,stt:speechStub,sendWc(){},agentStatus,shell:{showItemInFolder(){}},refreshAppMenu(){} });
   vm.runInContext(source.slice(source.indexOf('function settingsFile()'),source.indexOf('function sendWc(')),ctx);
   vm.runInContext('credentialStore().initialize()',ctx);
   vm.runInContext(source.slice(source.indexOf('function sessionEnv('),source.indexOf('// ---- IPC: terminal / harness')),ctx);
@@ -33,7 +40,7 @@ function harness(t, available) {
   vm.runInContext(source.slice(source.indexOf('async function runSpeech('),source.indexOf('// Every session inherits')),ctx);
   vm.runInContext(source.slice(source.indexOf("ipcMain.handle('agents:status'"),source.indexOf("ipcMain.handle('agents:status'")+source.slice(source.indexOf("ipcMain.handle('agents:status'")).indexOf('\n});')+4),ctx);
   vm.runInContext(source.slice(source.indexOf("ipcMain.handle('theme:set'"),source.indexOf("ipcMain.handle('folder:pick'")),ctx);
-  return {secret,dir,ctx,handlers};
+  return {secret,dir,ctx,handlers,probes,reads,savedMaps};
 }
 for(const available of [true,false]) test(`IPC responses contain no secrets with storage ${available?'available':'blocked'}`, t=>{
   const h=harness(t,available);
@@ -72,9 +79,21 @@ test('unavailable storage disables only saved keys: sessions, agent status, shel
   assert.equal(env.OPENAI_API_KEY, envOnly);
   assert.ok(!JSON.stringify(env).includes(h.secret));
   // Agent status keeps the shape the launcher renders.
-  const agent = await h.handlers.get('agents:status')({}, { id: 'grok' });
-  assert.equal(agent.signedIn, null);
-  assert.equal(agent.savedKeyCount, 0);
+  const agent = await h.handlers.get('agents:status')({}, { id: 'claude' });
+  assert.equal(agent.id, 'claude');
+  assert.equal(agent.signedIn, true);
+  assert.equal(agent.label, 'fixture@example.invalid · Max');
+  assert.equal(agent.source, 'claude auth status');
+  assert.deepEqual(agent.rows, [
+    {k:'Account',v:'fixture@example.invalid'},
+    {k:'Plan',v:'Max'},
+    {k:'Signed in',v:'through claude.ai'},
+  ]);
+  assert.deepEqual(h.probes, ['claude auth status --json']);
+  assert.equal(Object.keys(h.savedMaps[0]).length, 0);
+  await h.handlers.get('agents:status')({}, {id:'grok'});
+  assert.ok(h.reads.length > 0);
+  assert.ok(h.reads.every(file=>file.startsWith(path.join(h.dir,'fixture-home')+path.sep)));
   // A key exported in the shell still drives a keyed speech provider.
   let status = h.handlers.get('stt:status')({});
   assert.equal(status.providers[0].ready, true);
@@ -127,4 +146,24 @@ test('production speech and agent lookup preserve precedence without persisting 
   for (const file of ['settings.json', 'credentials.json']) {
     assert.ok(!fs.readFileSync(path.join(h.dir, file), 'utf8').includes('environment-only-dummy'));
   }
+});
+
+test('cleanup status reaches key IPC without leaking source or disabling committed mutations',t=>{
+  const h=harness(t,true), file=path.join(h.dir,'settings.json');
+  fs.writeFileSync(file,'invalid fixture');
+  for(const [channel,arg] of [['keys:set',{name:'NEW_KEY',value:h.secret}],['keys:delete',{name:'OPENAI_API_KEY'}],['keys:retry'],['keys:get']]) {
+    const result=h.handlers.get(channel)({},arg);
+    assert.equal(result.ok,true,channel);
+    assert.equal(result.cleanupPending,true,channel);
+    assert.ok(result.cleanupWarning.includes('Plaintext cleanup is incomplete'));
+    assert.ok(!JSON.stringify(result).includes(h.secret));
+  }
+  assert.equal(h.handlers.get('keys:reveal')({},{name:'NEW_KEY'}).value,h.secret);
+  assert.equal(h.handlers.get('keys:reveal')({},{name:'OPENAI_API_KEY'}).value,'');
+  fs.writeFileSync(file,JSON.stringify({theme:'dusk',envKeys:{OPENAI_API_KEY:h.secret}}));
+  assert.equal(h.handlers.get('keys:retry')({}).cleanupPending,false);
+  assert.equal(h.handlers.get('keys:get')({}).cleanupWarning,null);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file,'utf8')),{theme:'dusk'});
+  const legacy=h.handlers.get('settings:set')({},{elevenKey:h.secret});
+  assert.equal(legacy.cleanupPending,false); assert.equal(legacy.cleanupWarning,null);
 });

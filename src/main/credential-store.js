@@ -13,6 +13,8 @@ const validRef = name => typeof name === 'string' && (validName(name) || (name.s
 const validId = id => typeof id === 'string' && (id.startsWith('named:') ? validName(id.slice(6)) : id.startsWith('legacy:') && LEGACY.includes(id.slice(7)));
 const ERROR = 'Saved keys are unavailable. Unlock your system key store, check disk space and file permissions, then retry. If the credential file is damaged, restore an encrypted copy for this app profile.';
 const SETTINGS_ERROR = 'settings.json is unreadable. Fix or restore that file, then retry. Nothing was overwritten.';
+const CLEANUP_WARNING = 'Plaintext cleanup is incomplete. Encrypted data is preserved. Check settings.json permissions and contents, then retry cleanup.';
+const SOURCE_CHANGED_ERROR = 'Settings keys changed during migration. Nothing was removed from settings.json. Retry to import the updated source.';
 function preferences(doc) {
   const out = { ...doc }; delete out.envKeys;
   for (const key of LEGACY) delete out[key];
@@ -27,6 +29,9 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
   // and never throw: a store that is unavailable yields no saved keys, it does
   // not take terminals, agent status or shell-provided keys down with it.
   let state = null, error = 'Saved keys have not been initialized.', kind = 'storage';
+  let cleanupPending = false, cleanupWarning = null;
+  const cleanupStatus = () => ({ cleanupPending, cleanupWarning });
+  const result = value => ({ ...value, ...cleanupStatus() });
   function protect() {
     if (!['darwin', 'win32', 'linux'].includes(platform) || !encryption.isEncryptionAvailable()) throw new Error(ERROR);
     if (platform === 'linux' && ['basic_text', 'unknown'].includes(encryption.getSelectedStorageBackend())) throw new Error(ERROR);
@@ -39,10 +44,22 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
       return doc;
     } catch (_) { throw sourceError(); }
   }
-  // Remove plaintext key fields from settings.json, keeping every preference.
-  function scrubSettings() {
+  // Validate and sanitize exactly one snapshot; never reread between comparison
+  // and replacement. Independent processes must still use separate profiles.
+  function scrubSettings(source) {
+    cleanupPending = true; cleanupWarning = CLEANUP_WARNING;
     const current = settings();
-    if (own(current, 'envKeys') || LEGACY.some(k => own(current, k))) io.write(settingsFile, JSON.stringify(preferences(current), null, 2) + '\n');
+    if (source && JSON.stringify(secretFields(current)) !== JSON.stringify(secretFields(source))) {
+      const e = new Error(SOURCE_CHANGED_ERROR); e.kind = 'source'; throw e;
+    }
+    if (Object.keys(secretFields(current)).length) {
+      io.write(settingsFile, JSON.stringify(preferences(current), null, 2) + '\n');
+      if (Object.keys(secretFields(settings())).length) throw new Error(CLEANUP_WARNING);
+    }
+    cleanupPending = false; cleanupWarning = null;
+  }
+  function retryCleanup() {
+    try { scrubSettings(); } catch (_) { /* Keep verified encrypted keys usable. */ }
   }
   function validate(doc) {
     if (!record(doc) || doc.version !== 1 || !['pending', 'complete'].includes(doc.migration)
@@ -72,21 +89,25 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
   }
   // The store itself is unusable (as opposed to one operation having failed).
   function unavailable(why) {
-    state = null; kind = why === 'settings' ? 'settings' : 'storage';
-    error = kind === 'settings' ? SETTINGS_ERROR : ERROR;
-    return { ok: false, error };
+    state = null; kind = ['settings', 'source'].includes(why) ? 'settings' : 'storage';
+    error = why === 'source' ? SOURCE_CHANGED_ERROR : kind === 'settings' ? SETTINGS_ERROR : ERROR;
+    return result({ ok: false, error });
   }
   function initialize() {
+    // Retry must not discard verified in-memory keys just because protection is
+    // temporarily unavailable. A fresh process still fails closed.
+    try { protect(); } catch (_) {
+      return state && !error ? result({ ok: false, error: ERROR }) : unavailable('storage');
+    }
     try {
-      protect();
       const next = io.exists(file) ? load() : { version: 1, migration: 'pending', named: {}, legacy: {}, imported: [], tombstones: {} };
       if (next.migration === 'complete') {
         // load() has already verified the persisted ciphertext. A finished
         // migration no longer needs settings.json, so a damaged preferences file
         // must not take saved keys down; stale plaintext is scrubbed when it can be.
         state = next; error = null;
-        try { scrubSettings(); } catch (_) {}
-        return { ok: true };
+        retryCleanup();
+        return result({ ok: true });
       }
       // A pending migration needs its source: fail closed and leave it untouched.
       const source = settings();
@@ -106,18 +127,17 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
       persist(next);
       // An external writer may add a key while ciphertext is being persisted.
       // Preserve its source and retry instead of removing an unimported value.
-      if (JSON.stringify(secretFields(settings())) !== JSON.stringify(secretFields(source))) throw new Error(ERROR);
-      scrubSettings();
+      scrubSettings(source);
       persist({ ...next, migration: 'complete' });
       error = null;
-      return { ok: true };
+      return result({ ok: true });
     } catch (e) { return unavailable(e && e.kind); }
   }
   function change(fn) {
-    if (error || !state) return { ok: false, error: error || ERROR };
+    if (error || !state) return result({ ok: false, error: error || ERROR });
     let next;
     // Cannot encrypt right now: refuse the write, keep serving what is in memory.
-    try { protect(); } catch (_) { return { ok: false, error: ERROR }; }
+    try { protect(); } catch (_) { return result({ ok: false, error: ERROR }); }
     // A damaged or replaced vault must not be overwritten from a stale cache.
     try { next = load(); if (next.migration !== 'complete') throw new Error(ERROR); }
     catch (_) { return unavailable('storage'); }
@@ -129,18 +149,18 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
       // new one, never a partial. Adopt whichever verifies; only a vault that no
       // longer verifies makes the store unavailable.
       try { state = load(); } catch (_) { return unavailable('storage'); }
-      if (JSON.stringify(state) !== wanted) return { ok: false, error: ERROR };
+      if (JSON.stringify(state) !== wanted) return result({ ok: false, error: ERROR });
     }
     // The key is committed. Plaintext cleanup is retried on the next change or launch.
-    try { scrubSettings(); } catch (_) {}
-    return { ok: true };
+    retryCleanup();
+    return result({ ok: true });
   }
   function set(name, value) {
-    if (!validName(name) || typeof value !== 'string' || !value.trim()) return { ok: false, error: 'Enter a valid key name and nonempty secret.' };
+    if (!validName(name) || typeof value !== 'string' || !value.trim()) return result({ ok: false, error: 'Enter a valid key name and nonempty secret.' });
     return change(next => { next.named[name] = value.trim(); delete next.tombstones['named:' + name]; });
   }
   function remove(name) {
-    if (!validRef(name)) return { ok: false, error: 'Invalid key name.' };
+    if (!validRef(name)) return result({ ok: false, error: 'Invalid key name.' });
     return change(next => {
       if (name.startsWith('legacy:')) { const k = name.slice(7); delete next.legacy[k]; next.tombstones[name] = true; }
       else {
@@ -151,7 +171,7 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
   }
   function setLegacy(patch) {
     if (!record(patch) || LEGACY.some(k => own(patch, k) && patch[k] !== null && typeof patch[k] !== 'string')) {
-      return { ok: false, error: 'API keys must be text, or null to remove them.' };
+      return result({ ok: false, error: 'API keys must be text, or null to remove them.' });
     }
     return change(next => {
       for (const k of LEGACY) {
@@ -168,27 +188,27 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
     });
   }
   const usable = () => !error && !!state;
-  const status = () => ({ ok: !error, error, kind: error ? kind : null });
+  const status = () => result({ ok: !error, error, kind: error ? kind : null });
   // Total by design: consumers (session env, speech, agent status) get no saved
   // keys when the store is unavailable, and ask status() if they need to say why.
   function context() { return usable() ? { envKeys: { ...state.named }, ...state.legacy } : { envKeys: {} }; }
   function list() {
-    if (!usable()) return { ok: false, error: error || ERROR, kind };
+    if (!usable()) return result({ ok: false, error: error || ERROR, kind });
     const stored = Object.entries(state.named)
       .map(([name, value]) => ({ name, masked: masked(value) }))
       .sort((a, b) => a.name.localeCompare(b.name));
     const legacy = Object.entries(state.legacy)
       .map(([name, value]) => ({ name: 'legacy:' + name, masked: masked(value) }));
-    return { ok: true, stored, legacy };
+    return result({ ok: true, stored, legacy });
   }
   function reveal(name) {
-    if (!validRef(name)) return { ok: false, error: 'Invalid key name.' };
-    if (!usable()) return { ok: false, error: error || ERROR };
+    if (!validRef(name)) return result({ ok: false, error: 'Invalid key name.' });
+    if (!usable()) return result({ ok: false, error: error || ERROR });
     const legacy = name.startsWith('legacy:');
     const entries = legacy ? state.legacy : state.named;
     const key = legacy ? name.slice(7) : name;
-    return { ok: true, value: own(entries, key) ? entries[key] : '' };
+    return result({ ok: true, value: own(entries, key) ? entries[key] : '' });
   }
   return { initialize, set, remove, setLegacy, context, list, reveal, status };
 }
-module.exports = { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR };
+module.exports = { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, SOURCE_CHANGED_ERROR };
