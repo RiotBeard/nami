@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, SOURCE_CHANGED_ERROR } from '../src/main/credential-store.js';
+import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, CLEANUP_ERROR, SOURCE_CHANGED_ERROR } from '../src/main/credential-store.js';
 import { writeSettings } from '../src/main/settings.js';
 import { sttConfig } from '../src/main/stt.js';
 const secret = ['dummy','value','987654321'].join('-');
@@ -54,7 +54,9 @@ for (const failAt of [1,2,3]) test(`migration recovers after failure at write ${
   const f = fixture({ envKeys: { TEST_KEY: secret }, theme: 'glass' });
   const original = f.io.write; let count = 0;
   f.io.write = (file,text) => { if (++count === failAt) throw new Error(secret); original(file,text); };
-  const s = f.make(); assertFailure(s.initialize(), ERROR);
+  // Write 2 is the settings.json scrub, which names that file instead of the key store.
+  const s = f.make(); assertFailure(s.initialize(), failAt === 2 ? CLEANUP_ERROR : ERROR);
+  assert.equal(s.status().kind, failAt === 2 ? 'settings' : 'storage');
   assert.deepEqual(s.context(), { envKeys: {} }); // reads never throw
   f.io.write = original;
   const restarted = f.make(); assert.equal(restarted.initialize().ok, true);
@@ -215,7 +217,7 @@ test('an unavailable store yields no saved keys and never throws on reads', () =
   assert.deepEqual(store.context(), { envKeys: {} }); // before initialize
   assert.equal(store.initialize().ok, false);
   assert.deepEqual(store.context(), { envKeys: {} });
-  assert.deepEqual(store.status(), { ok: false, error: ERROR, kind: 'storage', cleanupPending: false, cleanupWarning: null });
+  assert.deepEqual(store.status(), { ok: false, error: ERROR, kind: 'storage', migration: 'unknown', cleanupPending: false, cleanupWarning: null, skippedKeys: [], skippedWarning: null });
   assert.equal(store.list().ok, false);
   assert.equal(store.reveal('OPENAI_API_KEY').ok, false);
 });
@@ -273,7 +275,7 @@ test('a migrated vault does not depend on settings.json being readable', () => {
   assert.equal(f.files.get('settings'), 'not json');
 });
 test('a pending migration with an unreadable or malformed source fails closed and says which file', () => {
-  for (const source of ['not json', '[]', JSON.stringify({ envKeys: { 'bad-name': secret } }), JSON.stringify({ openaiKey: 12 })]) {
+  for (const source of ['not json', '[]', '"a string"', '42']) {
     const f = fixture(); f.files.set('settings', source);
     const store = f.make();
     assertFailure(store.initialize(), SETTINGS_ERROR);
@@ -376,8 +378,8 @@ test('retry while protection is unavailable preserves verified keys and pending 
   assert.equal(store.initialize().cleanupPending, true);
   const before = f.files.get('vault'), writes = f.writes.length;
   f.encryption.isEncryptionAvailable = () => false;
-  const retried = store.initialize();
-  assertFailure(retried, ERROR);
+  const retried = store.retry();
+  assert.equal(retried.ok, true);
   assert.equal(retried.cleanupPending, true);
   assert.equal(store.status().ok, true);
   assert.equal(store.context().envKeys.KEY, secret);
@@ -389,7 +391,7 @@ test('retry while protection is unavailable preserves verified keys and pending 
   assert.equal(f.make().initialize().ok, false);
   f.encryption.isEncryptionAvailable = () => true;
   f.files.set('settings', JSON.stringify({envKeys:{KEY:secret},theme:'paper'}));
-  assert.equal(store.initialize().cleanupPending, false);
+  assert.equal(store.retry().cleanupPending, false);
   assert.deepEqual(JSON.parse(f.files.get('settings')), {theme:'paper'});
 });
 
@@ -414,4 +416,92 @@ test('a locked key store during a save leaves the verified vault usable when not
   assert.equal(f.files.get('vault'), before);
   f.encryption.decryptString = decryptString;
   assert.equal(store.set('OTHER', 'other-dummy-value').ok, true);
+});
+
+test('status reports the migration state and whether settings.json can be read', () => {
+  const f = fixture({ theme: 'paper' }), store = f.make();
+  assert.equal(store.status().migration, 'unknown');
+  assert.equal(store.settingsReadable(), true);
+  store.initialize(); assert.equal(store.status().migration, 'complete');
+  assert.equal(f.make().status().migration, 'unknown'); // before initialize
+  f.files.set('settings', 'not json'); assert.equal(store.settingsReadable(), false);
+  f.files.set('settings', '[]'); assert.equal(store.settingsReadable(), false);
+  f.files.set('settings', '   \n'); assert.equal(store.settingsReadable(), true);
+  f.files.delete('settings'); assert.equal(store.settingsReadable(), true);
+  // Pending: no vault yet and an unreadable source.
+  f.files.set('settings', 'not json'); f.files.delete('vault');
+  const pending = f.make(); assertFailure(pending.initialize(), SETTINGS_ERROR);
+  assert.equal(pending.status().migration, 'pending');
+  // Unknown: a vault exists but cannot be read.
+  f.files.set('vault', 'damaged');
+  const unknown = f.make(); assert.equal(unknown.initialize().ok, false);
+  assert.equal(unknown.status().migration, 'unknown');
+});
+test('an empty settings.json is an empty migration source, not an unreadable one', () => {
+  for (const text of ['', ' \n\t']) {
+    const f = fixture(); f.files.set('settings', text);
+    const store = f.make(); assert.equal(store.initialize().ok, true);
+    assert.equal(store.set('KEY', secret).ok, true);
+    assert.equal(f.files.get('settings'), text); // nothing to scrub, nothing rewritten
+  }
+});
+test('malformed envKeys entries are skipped, left in place and reported by name only', () => {
+  const skippedValue = 'skipped-dummy-value';
+  const f = fixture({ theme: 'glass', envKeys: { OPENAI_API_KEY: secret, 'MY-KEY': skippedValue, NUM: 5, EMPTY: '' }, openaiKey: 12, elevenKey: '' });
+  const store = f.make(), init = store.initialize();
+  assert.equal(init.ok, true); assert.equal(init.cleanupPending, false);
+  assert.equal(store.status().migration, 'complete');
+  assert.equal(store.reveal('OPENAI_API_KEY').value, secret);
+  assert.deepEqual(store.list().legacy, []); // '' is stale, never a phantom row
+  assert.deepEqual(JSON.parse(f.files.get('settings')), { theme: 'glass', envKeys: { 'MY-KEY': skippedValue, NUM: 5 }, openaiKey: 12 });
+  assert.deepEqual(init.skippedKeys, ['MY-KEY', 'NUM', 'openaiKey']);
+  assert.ok(init.skippedWarning.includes('MY-KEY') && init.skippedWarning.includes('settings.json'));
+  for (const response of [init, store.status(), store.list(), store.set('OTHER', secret)]) {
+    assert.deepEqual(response.skippedKeys, ['MY-KEY', 'NUM', 'openaiKey']);
+    assert.ok(!JSON.stringify(response).includes(skippedValue) && !JSON.stringify(response).includes(secret));
+  }
+  // Still reported after a restart, and gone once the user fixes the file.
+  const restarted = f.make(); assert.deepEqual(restarted.initialize().skippedKeys, ['MY-KEY', 'NUM', 'openaiKey']);
+  f.files.set('settings', JSON.stringify({ theme: 'glass' }));
+  assert.deepEqual(restarted.retry().skippedKeys, []); assert.equal(restarted.status().skippedWarning, null);
+  // A non-object envKeys field is skipped as a whole.
+  const g = fixture({ envKeys: 'not an object', openaiKey: secret }), other = g.make();
+  assert.equal(other.initialize().ok, true); assert.deepEqual(other.status().skippedKeys, ['envKeys']);
+  assert.equal(other.context().openaiKey, secret);
+  assert.deepEqual(JSON.parse(g.files.get('settings')), { envKeys: 'not an object' });
+});
+test('a cleanup failure during first migration names settings.json, not the key store', () => {
+  const f = fixture({ envKeys: { KEY: secret }, theme: 'dusk' }), write = f.io.write;
+  f.io.write = (file, text) => { if (file === 'settings') throw new Error('EACCES'); write(file, text); };
+  const store = f.make(), init = store.initialize();
+  assertFailure(init, CLEANUP_ERROR);
+  assert.equal(store.status().kind, 'settings'); assert.equal(store.list().kind, 'settings');
+  assert.ok(CLEANUP_ERROR.includes('settings.json'));
+  assert.equal(JSON.parse(f.files.get('settings')).envKeys.KEY, secret);
+  assert.equal(store.status().migration, 'pending');
+  f.io.write = write;
+  assert.equal(store.retry().ok, true);
+  assert.equal(store.reveal('KEY').value, secret);
+  assert.deepEqual(JSON.parse(f.files.get('settings')), { theme: 'dusk' });
+});
+test('retry on a usable store only retries cleanup and never needs the key store', () => {
+  const f = fixture({ envKeys: { KEY: secret } }), store = f.make(); store.initialize();
+  f.files.set('settings', 'unreadable fixture');
+  assert.equal(store.retry().cleanupPending, true);
+  let encrypts = 0; const encrypt = f.encryption.encryptString;
+  f.encryption.encryptString = text => { encrypts++; return encrypt(text); };
+  f.encryption.isEncryptionAvailable = () => false;
+  f.files.set('settings', JSON.stringify({ envKeys: { KEY: secret }, theme: 'paper' }));
+  const retried = store.retry();
+  assert.equal(retried.ok, true); assert.equal(retried.cleanupPending, false);
+  assert.equal(encrypts, 0);
+  assert.deepEqual(JSON.parse(f.files.get('settings')), { theme: 'paper' });
+  assert.equal(store.reveal('KEY').value, secret);
+  // An unavailable store retries the whole initialization.
+  f.encryption.isEncryptionAvailable = () => true;
+  f.files.set('vault', 'damaged');
+  assert.equal(store.set('X', secret).ok, false); assert.equal(store.status().ok, false);
+  assert.equal(store.retry().ok, false);
+  f.files.set('vault', f.writes.filter(([file]) => file === 'vault').at(-1)[1]);
+  assert.equal(store.retry().ok, true); assert.equal(store.reveal('KEY').value, secret);
 });
