@@ -70,18 +70,31 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
     if (!doc.imported.every(validId) || !Object.entries(doc.tombstones).every(([k,v]) => validId(k) && v === true)) throw new Error(ERROR);
     return doc;
   }
+  // Raw file text behind `state`, so a mutation can tell "unchanged on disk"
+  // from "replaced or damaged" without asking the key store to decrypt again.
+  let verifiedText = null;
   function load() {
-    const envelope = JSON.parse(io.read(file));
+    const raw = io.read(file);
+    const envelope = JSON.parse(raw);
     if (!record(envelope) || envelope.version !== 1 || typeof envelope.ciphertext !== 'string'
       || !envelope.ciphertext || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(envelope.ciphertext)) throw new Error(ERROR);
-    return validate(JSON.parse(encryption.decryptString(Buffer.from(envelope.ciphertext, 'base64'))));
+    const doc = validate(JSON.parse(encryption.decryptString(Buffer.from(envelope.ciphertext, 'base64'))));
+    verifiedText = raw;
+    return doc;
   }
+  // Whether the last persist() attempted the atomic rename; before that point
+  // the disk still holds the previous vault and the in-memory state is valid.
+  let written = false;
   function persist(next) {
+    written = false;
     protect();
     const text = JSON.stringify(validate(next));
     const encrypted = encryption.encryptString(text);
     // Catch unusable encryption output before replacing a previously valid vault.
     if (!Buffer.isBuffer(encrypted) || !encrypted.length || encryption.decryptString(encrypted) !== text) throw new Error(ERROR);
+    // Once the write is attempted the disk may hold either vault, so any later
+    // failure has to re-read to find out which.
+    written = true;
     io.write(file, JSON.stringify({ version: 1, ciphertext: encrypted.toString('base64') }) + '\n');
     const verified = load();
     if (JSON.stringify(verified) !== text) throw new Error(ERROR);
@@ -139,12 +152,19 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
     // Cannot encrypt right now: refuse the write, keep serving what is in memory.
     try { protect(); } catch (_) { return result({ ok: false, error: ERROR }); }
     // A damaged or replaced vault must not be overwritten from a stale cache.
-    try { next = load(); if (next.migration !== 'complete') throw new Error(ERROR); }
-    catch (_) { return unavailable('storage'); }
+    // An unchanged file needs no decrypt, so a locked key store cannot turn a
+    // verified vault into an unavailable one here.
+    try {
+      next = io.read(file) === verifiedText ? JSON.parse(JSON.stringify(state)) : load();
+      if (next.migration !== 'complete') throw new Error(ERROR);
+    } catch (_) { return unavailable('storage'); }
     fn(next);
     const wanted = JSON.stringify(next);
     try { persist(next); }
     catch (_) {
+      // Nothing reached disk (locked key store, bad ciphertext, failed rename):
+      // the verified vault in memory is still the one on disk.
+      if (!written) return result({ ok: false, error: ERROR });
       // The write is an atomic rename, so the disk holds the old vault or the
       // new one, never a partial. Adopt whichever verifies; only a vault that no
       // longer verifies makes the store unavailable.

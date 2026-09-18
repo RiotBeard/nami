@@ -392,3 +392,26 @@ test('retry while protection is unavailable preserves verified keys and pending 
   assert.equal(store.initialize().cleanupPending, false);
   assert.deepEqual(JSON.parse(f.files.get('settings')), {theme:'paper'});
 });
+
+test('a locked key store during a save leaves the verified vault usable when nothing reached disk', () => {
+  const f = fixture(), store = f.make(); store.initialize(); store.set('KEY', secret);
+  const before = f.files.get('vault'), writes = f.writes.length;
+  const { encryptString, decryptString } = f.encryption;
+  // macOS with the Keychain locked: encryption is "available" but every call throws.
+  f.encryption.encryptString = () => { throw new Error('keychain locked'); };
+  f.encryption.decryptString = () => { throw new Error('keychain locked'); };
+  assertFailure(store.set('OTHER', 'other-dummy-value'), ERROR);
+  assert.equal(store.status().ok, true);
+  assert.equal(store.list().ok, true);
+  assert.equal(store.reveal('KEY').value, secret);
+  assert.equal(store.context().envKeys.KEY, secret);
+  assert.equal(f.files.get('vault'), before);
+  assert.equal(f.writes.length, writes);
+  // The in-memory sanity decrypt failing after a good encrypt is the same case.
+  f.encryption.encryptString = encryptString;
+  assertFailure(store.set('OTHER', 'other-dummy-value'), ERROR);
+  assert.equal(store.reveal('KEY').value, secret);
+  assert.equal(f.files.get('vault'), before);
+  f.encryption.decryptString = decryptString;
+  assert.equal(store.set('OTHER', 'other-dummy-value').ok, true);
+});
