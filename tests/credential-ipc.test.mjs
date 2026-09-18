@@ -223,3 +223,24 @@ test('keys:retry on a usable store retries cleanup without the key store and rep
   assert.equal(h.handlers.get('keys:reveal')({}, { name: 'OPENAI_API_KEY' }).value, h.secret);
   assert.ok(!JSON.stringify(h.handlers.get('settings:get')({})).includes('skipped-dummy'));
 });
+
+test('corrected source recovery and damaged-vault cleanup refusal reach IPC safely', t => {
+  const h=harness(t,true), settings=path.join(h.dir,'settings.json'), vault=path.join(h.dir,'credentials.json');
+  fs.writeFileSync(settings,JSON.stringify({envKeys:{'BAD-NAME':h.secret}}));
+  assert.deepEqual(h.handlers.get('keys:retry')({}).skippedKeys,['BAD-NAME']);
+  fs.writeFileSync(settings,JSON.stringify({envKeys:{FIXED_NAME:h.secret},theme:'dusk'}));
+  const imported=h.handlers.get('keys:retry')({});
+  assert.equal(imported.cleanupPending,false);
+  assert.equal(h.handlers.get('keys:reveal')({},{name:'FIXED_NAME'}).value,h.secret);
+  const good=fs.readFileSync(vault), source=JSON.stringify({envKeys:{FIXED_NAME:h.secret},theme:'paper'});
+  fs.writeFileSync(settings,source);fs.writeFileSync(vault,'damaged fixture');
+  const blocked=h.handlers.get('keys:retry')({});
+  assert.equal(blocked.cleanupPending,true);assert.ok(blocked.cleanupWarning.includes('credentials.json'));
+  assert.equal(h.handlers.get('keys:set')({},{name:'OTHER',value:h.secret}).ok,false);
+  assert.equal(h.handlers.get('keys:reveal')({},{name:'FIXED_NAME'}).value,h.secret);
+  assert.equal(fs.readFileSync(settings,'utf8'),source);
+  for(const response of [imported,blocked,h.handlers.get('keys:get')({}),h.handlers.get('settings:get')({})]) assert.ok(!JSON.stringify(response).includes(h.secret));
+  fs.writeFileSync(vault,good);
+  assert.equal(h.handlers.get('keys:retry')({}).cleanupPending,false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(settings,'utf8')),{theme:'paper'});
+});

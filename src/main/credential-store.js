@@ -14,6 +14,8 @@ const validId = id => typeof id === 'string' && (id.startsWith('named:') ? valid
 const ERROR = 'Saved keys are unavailable. Unlock your system key store, check disk space and file permissions, then retry. If the credential file is damaged, restore an encrypted copy for this app profile.';
 const SETTINGS_ERROR = 'settings.json is unreadable. Fix or restore that file, then retry. Nothing was overwritten.';
 const CLEANUP_WARNING = 'Plaintext cleanup is incomplete. Encrypted data is preserved. Check settings.json permissions and contents, then retry cleanup.';
+const VAULT_WARNING = 'Plaintext cleanup is blocked because credentials.json could not be verified. Restore a valid encrypted vault for this profile, unlock system protection if needed, then retry. Settings were preserved.';
+const RECOVERY_WARNING = 'Settings contain keys that still need encrypted storage. Unlock system protection, check disk space and permissions, then retry. Plaintext source entries were preserved.';
 const CLEANUP_ERROR = 'Plaintext cleanup could not finish during migration. Check settings.json permissions, then retry. Encrypted data is preserved.';
 const SOURCE_CHANGED_ERROR = 'Settings keys changed during migration. Nothing was removed from settings.json. Retry to import the updated source.';
 const skippedWarning = names => `These settings.json entries could not be imported and remain unencrypted there: ${names.join(', ')}. Fix or remove them in settings.json.`;
@@ -87,15 +89,15 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
     skippedKeys = skippedIn(current);
     if (source && JSON.stringify(secretFields(current)) !== JSON.stringify(secretFields(source))) throw tagged(SOURCE_CHANGED_ERROR, 'source');
     if (hasImportable(current)) {
+      // Do not delete a source based only on a cache after its durable copy changed.
+      try { if (io.read(file) !== verifiedText) throw new Error(); }
+      catch (_) { migration = 'unknown'; throw tagged(VAULT_WARNING, 'vault'); }
       try {
         io.write(settingsFile, JSON.stringify(scrubbed(current), null, 2) + '\n');
         if (hasImportable(settings())) throw new Error();
       } catch (_) { throw tagged(CLEANUP_ERROR, 'settings'); }
     }
     cleanupPending = false; cleanupWarning = null;
-  }
-  function retryCleanup() {
-    try { scrubSettings(); } catch (_) { /* Keep verified encrypted keys usable. */ }
   }
   function validate(doc) {
     if (!record(doc) || doc.version !== 1 || !['pending', 'complete'].includes(doc.migration)
@@ -109,14 +111,23 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
   // Raw file text behind `state`, so a mutation can tell "unchanged on disk"
   // from "replaced or damaged" without asking the key store to decrypt again.
   let verifiedText = null;
-  function load() {
-    const raw = io.read(file);
+  function load(raw = io.read(file)) {
     const envelope = JSON.parse(raw);
     if (!record(envelope) || envelope.version !== 1 || typeof envelope.ciphertext !== 'string'
       || !envelope.ciphertext || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(envelope.ciphertext)) throw new Error(ERROR);
     const doc = validate(JSON.parse(encryption.decryptString(Buffer.from(envelope.ciphertext, 'base64'))));
-    verifiedText = raw;
-    return doc;
+    return { rawText: raw, document: doc };
+  }
+  function adopt(snapshot) {
+    verifiedText = snapshot.rawText;
+    state = snapshot.document;
+    migration = state.migration;
+  }
+  function synchronize() {
+    const raw = io.read(file);
+    if (state && raw === verifiedText) { migration = state.migration; return; }
+    protect();
+    adopt(load(raw));
   }
   // Whether the last persist() attempted the atomic rename; before that point
   // the disk still holds the previous vault and the in-memory state is valid.
@@ -133,89 +144,119 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
     written = true;
     io.write(file, JSON.stringify({ version: 1, ciphertext: encrypted.toString('base64') }) + '\n');
     const verified = load();
-    if (JSON.stringify(verified) !== text) throw new Error(ERROR);
-    state = verified;
-    migration = verified.migration;
+    if (JSON.stringify(verified.document) !== text) throw new Error(ERROR);
+    adopt(verified);
   }
   // The store itself is unusable (as opposed to one operation having failed).
   // Errors that know which file is at fault carry `kind`; everything else is
   // reported as the key store or vault.
   function unavailable(err) {
     state = null;
-    kind = err && err.kind ? 'settings' : 'storage';
-    error = err && err.kind ? err.message : ERROR;
+    kind = err && ['settings', 'source'].includes(err.kind) ? 'settings' : 'storage';
+    error = err && err.kind === 'source' ? SOURCE_CHANGED_ERROR
+      : kind === 'settings' ? (err.message === CLEANUP_ERROR ? CLEANUP_ERROR : SETTINGS_ERROR)
+      : ERROR;
     return result({ ok: false, error });
   }
-  function initialize() {
-    try { protect(); } catch (_) { return unavailable(null); }
-    let next;
-    try { next = io.exists(file) ? load() : { version: 1, migration: 'pending', named: {}, legacy: {}, imported: [], tombstones: {} }; }
-    catch (e) { migration = 'unknown'; return unavailable(e); }
-    migration = next.migration;
+  const clone = doc => JSON.parse(JSON.stringify(doc));
+  // Import only unseen identifiers. Existing values, imports and tombstones win.
+  function reconcile(next, source) {
+    const entries = [
+      ...Object.entries(record(source.envKeys) ? source.envKeys : {}).filter(([name, value]) => importable(name, value)).map(([name, value]) => ['named', name, value]),
+      ...LEGACY.filter(name => typeof source[name] === 'string').map(name => ['legacy', name, source[name]]),
+    ];
+    for (const [group, name, value] of entries) {
+      if (!value) continue;
+      const id = group + ':' + name;
+      if (own(next[group], name) || own(next.tombstones, id) || next.imported.includes(id)) continue;
+      next[group][name] = value;
+      next.imported.push(id);
+    }
+    return next;
+  }
+  // Recover a possibly committed atomic write without pairing new bytes with old state.
+  function commit(next) {
+    try { persist(next); }
+    catch (e) {
+      if (!written) throw e;
+      try { adopt(load()); }
+      catch (readError) { migration = 'unknown'; pendingWarning(VAULT_WARNING); throw readError; }
+      if (JSON.stringify(state) !== JSON.stringify(next)) throw e;
+    }
+  }
+  function finishMigration(next) {
+    const source = settings();
+    skippedKeys = skippedIn(source);
+    reconcile(next, source);
+    persist(next);
+    scrubSettings(source);
+    persist({ ...next, migration: 'complete' });
+    error = null;
+  }
+  function pendingWarning(message) {
+    cleanupPending = true; cleanupWarning = message;
+  }
+  function retryCleanup() {
+    pendingWarning(VAULT_WARNING);
+    try { synchronize(); }
+    catch (_) { migration = 'unknown'; return; }
+    if (state.migration === 'pending') {
+      try { finishMigration(clone(state)); }
+      catch (e) { unavailable(e); }
+      return;
+    }
     try {
-      if (next.migration === 'complete') {
-        // load() has already verified the persisted ciphertext. A finished
-        // migration no longer needs settings.json, so a damaged preferences file
-        // must not take saved keys down; stale plaintext is scrubbed when it can be.
-        state = next; error = null;
-        retryCleanup();
-        return result({ ok: true });
-      }
-      // A pending migration needs its source: fail closed and leave it untouched.
+      pendingWarning(CLEANUP_WARNING);
       const source = settings();
       skippedKeys = skippedIn(source);
-      for (const [name, value] of Object.entries(record(source.envKeys) ? source.envKeys : {})) {
-        if (!importable(name, value) || value === '') continue;
-        const id = 'named:' + name;
-        if (!own(next.named, name) && !own(next.tombstones, id) && !next.imported.includes(id)) next.named[name] = value;
-        if (!next.imported.includes(id)) next.imported.push(id);
+      const next = reconcile(clone(state), source);
+      if (JSON.stringify(next) !== JSON.stringify(state)) {
+        pendingWarning(RECOVERY_WARNING);
+        commit(next);
       }
-      for (const name of LEGACY) if (typeof source[name] === 'string' && source[name] !== '') {
-        const id = 'legacy:' + name;
-        if (!own(next.legacy, name) && !own(next.tombstones, id) && !next.imported.includes(id)) next.legacy[name] = source[name];
-        if (!next.imported.includes(id)) next.imported.push(id);
-      }
-      persist(next);
-      // An external writer may add a key while ciphertext is being persisted.
-      // Preserve its source and retry instead of removing an unimported value.
       scrubSettings(source);
-      persist({ ...next, migration: 'complete' });
+    } catch (e) {
+      // A completed cache remains usable; source recovery is a separate result.
+      if (e && e.kind === 'vault') pendingWarning(VAULT_WARNING);
+    }
+  }
+  function initialize() {
+    try {
+      protect();
+      if (io.exists(file)) adopt(load());
+      else { state = null; verifiedText = null; migration = 'pending'; }
+    } catch (e) { migration = 'unknown'; return unavailable(e); }
+    if (state && state.migration === 'complete') {
       error = null;
+      retryCleanup();
+      return result({ ok: !error, ...(error ? { error } : {}) });
+    }
+    try {
+      finishMigration(state ? clone(state) : { version: 1, migration: 'pending', named: {}, legacy: {}, imported: [], tombstones: {} });
       return result({ ok: true });
     } catch (e) { return unavailable(e); }
   }
-  // What the Retry control does: a usable store only needs its plaintext cleanup
-  // retried, which never touches the key store; anything else starts over.
   function retry() {
     if (usable()) { retryCleanup(); return status(); }
     return initialize();
   }
   function change(fn) {
-    if (error || !state) return result({ ok: false, error: error || ERROR });
-    let next;
-    // Cannot encrypt right now: refuse the write, keep serving what is in memory.
+    if (!usable()) return result({ ok: false, error: error || ERROR });
     try { protect(); } catch (_) { return result({ ok: false, error: ERROR }); }
-    // A damaged or replaced vault must not be overwritten from a stale cache.
-    // An unchanged file needs no decrypt, so a locked key store cannot turn a
-    // verified vault into an unavailable one here.
-    try {
-      next = io.read(file) === verifiedText ? JSON.parse(JSON.stringify(state)) : load();
-      if (next.migration !== 'complete') throw new Error(ERROR);
-    } catch (_) { return unavailable(null); }
-    fn(next);
-    const wanted = JSON.stringify(next);
-    try { persist(next); }
+    try { synchronize(); }
     catch (_) {
-      // Nothing reached disk (locked key store, bad ciphertext, failed rename):
-      // the verified vault in memory is still the one on disk.
-      if (!written) return result({ ok: false, error: ERROR });
-      // The write is an atomic rename, so the disk holds the old vault or the
-      // new one, never a partial. Adopt whichever verifies; only a vault that no
-      // longer verifies makes the store unavailable.
-      try { state = load(); } catch (_) { return unavailable(null); }
-      if (JSON.stringify(state) !== wanted) return result({ ok: false, error: ERROR });
+      migration = 'unknown'; pendingWarning(VAULT_WARNING);
+      return result({ ok: false, error: ERROR });
     }
-    // The key is committed. Plaintext cleanup is retried on the next change or launch.
+    if (state.migration === 'pending') {
+      try { finishMigration(clone(state)); }
+      catch (e) { return unavailable(e); }
+    }
+    const next = clone(state);
+    fn(next);
+    try { commit(next); }
+    catch (_) { return result({ ok: false, error: ERROR }); }
+    // The requested encrypted mutation committed even if source recovery cannot.
     retryCleanup();
     return result({ ok: true });
   }
@@ -251,7 +292,7 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
       }
     });
   }
-  const usable = () => !error && !!state;
+  const usable = () => !error && !!state && state.migration === 'complete';
   const status = () => result({ ok: !error, error, kind: error ? kind : null, migration });
   // Total by design: consumers (session env, speech, agent status) get no saved
   // keys when the store is unavailable, and ask status() if they need to say why.
@@ -275,4 +316,4 @@ function createCredentialStore({ file, settingsFile, encryption, io = ioDefault,
   }
   return { initialize, retry, set, remove, setLegacy, context, list, reveal, status, settingsReadable };
 }
-module.exports = { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, CLEANUP_ERROR, SOURCE_CHANGED_ERROR };
+module.exports = { createCredentialStore, preferences, LEGACY, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, CLEANUP_ERROR, SOURCE_CHANGED_ERROR, VAULT_WARNING, RECOVERY_WARNING };

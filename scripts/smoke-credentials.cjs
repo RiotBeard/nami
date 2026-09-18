@@ -91,9 +91,12 @@ async function launch(check) {
       assert.equal((await run(`dainami.keysSet("RESTART_KEY",${JSON.stringify(saved)})`)).ok,true);
       assert.equal((await run('dainami.keysDelete("SMOKE_KEY")')).ok,true);
       assert.equal((await run('dainami.keysDelete("legacy:sttKey")')).ok,true);
-      // Removing the bad entry by hand clears the warning on the next check.
-      fs.writeFileSync(path.join(profile,'settings.json'),JSON.stringify({theme:'glass'}));
-      assert.deepEqual((await run('dainami.keysRetry()')).skippedKeys,[]);
+      // Correcting the skipped name must encrypt its value before removing it.
+      fs.writeFileSync(path.join(profile,'settings.json'),JSON.stringify({theme:'glass',envKeys:{RECOVERED_KEY:skipped}}));
+      await run('document.querySelector("#keys-retry").click()');
+      await until(()=>run('!document.querySelector("#keys-skipped-warning")'),'corrected entry recovered');
+      assert.equal((await run('dainami.keysReveal("RECOVERED_KEY")')).value,skipped);
+      assert.ok(!fs.readFileSync(path.join(profile,'settings.json'),'utf8').includes(skipped));
       assert.ok(!fs.readFileSync(path.join(profile,'settings.json'),'utf8').includes(secret));
       assert.ok(!fs.readFileSync(path.join(profile,'credentials.json'),'utf8').includes(secret));
       assert.equal(fs.statSync(path.join(profile,'credentials.json')).mode & 0o777,0o600);
@@ -101,6 +104,7 @@ async function launch(check) {
     console.log('PASS: actual safeStorage migration, masking, Reveal, saves, deletion, IPC sanitization and permissions');
     await launch(async run=>{
       assert.equal((await run('dainami.keysReveal("RESTART_KEY")')).value,saved);
+      assert.equal((await run('dainami.keysReveal("RECOVERED_KEY")')).value,skipped);
       assert.equal((await run('dainami.keysReveal("SMOKE_KEY")')).value,'');
       assert.equal((await run('dainami.keysReveal("legacy:sttKey")')).value,'');
       assert.equal((await run('dainami.keysDelete("RESTART_KEY")')).ok,true);
@@ -131,9 +135,17 @@ async function launch(check) {
       await until(()=>run('!!document.querySelector("#keys-retry")'),'Retry after failed save');
       assert.ok(!(await run('document.querySelector("#set-pane").innerText')).includes(saved));
       assert.equal(fs.readFileSync(vault,'utf8'),'damaged-while-running');
+      const recoverySource=JSON.stringify({theme:'glass',envKeys:{RECOVERED_KEY:skipped}});
+      fs.writeFileSync(path.join(profile,'settings.json'),recoverySource);
+      const refused=await run('dainami.keysRetry()');
+      assert.equal(refused.cleanupPending,true);
+      assert.ok(refused.cleanupWarning.includes('credentials.json'));
+      assert.equal(fs.readFileSync(path.join(profile,'settings.json'),'utf8'),recoverySource);
+      assert.equal((await run('dainami.keysReveal("RECOVERED_KEY")')).value,skipped);
+
       fs.writeFileSync(vault,recoverable);
       await run('document.querySelector("#keys-retry").click()');
-      await until(()=>run('!!document.querySelector("#key-new-save")'),'Retry after failed save recovers');
+      await until(()=>run('!document.querySelector("#keys-cleanup-warning") && !!document.querySelector("#key-new-save")'),'Retry after failed save recovers');
       assert.equal((await run('dainami.keysReveal("FAILED_SAVE")')).value,'');
       // A completed vault stays usable when disposable settings cannot be parsed.
       const settingsFile=path.join(profile,'settings.json');

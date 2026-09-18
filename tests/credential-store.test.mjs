@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, CLEANUP_ERROR, SOURCE_CHANGED_ERROR } from '../src/main/credential-store.js';
+import { createCredentialStore, preferences, ERROR, SETTINGS_ERROR, CLEANUP_WARNING, CLEANUP_ERROR, SOURCE_CHANGED_ERROR, VAULT_WARNING, RECOVERY_WARNING } from '../src/main/credential-store.js';
 import { writeSettings } from '../src/main/settings.js';
 import { sttConfig } from '../src/main/stt.js';
 const secret = ['dummy','value','987654321'].join('-');
@@ -12,7 +12,7 @@ function assertFailure(result, error) {
   assert.equal(result.ok, false);
   assert.equal(result.error, error);
   assert.equal(typeof result.cleanupPending, 'boolean');
-  assert.ok(result.cleanupWarning === null || result.cleanupWarning === CLEANUP_WARNING);
+  assert.ok(result.cleanupWarning === null || [CLEANUP_WARNING, VAULT_WARNING, RECOVERY_WARNING].includes(result.cleanupWarning));
 }
 function fixture(source = {}) {
   const files = new Map([['settings', JSON.stringify(source)]]), writes = [];
@@ -256,13 +256,14 @@ test('encryption lost mid-run refuses writes but keeps serving keys already in m
   assert.equal(store.context().envKeys.KEY, secret);
   assert.equal(store.status().ok, true);
 });
-test('a vault damaged mid-run makes the store unavailable and is never overwritten', () => {
+test('a vault damaged mid-run blocks writes but retains verified cached keys', () => {
   const f = fixture(), store = f.make(); store.initialize(); store.set('KEY', secret);
   f.files.set('vault', 'damaged');
   assert.equal(store.set('KEY', 'replacement-dummy').ok, false);
   assert.equal(f.files.get('vault'), 'damaged');
-  assert.deepEqual(store.context(), { envKeys: {} });
-  assert.equal(store.status().kind, 'storage');
+  assert.equal(store.context().envKeys.KEY, secret);
+  assert.equal(store.status().cleanupWarning, VAULT_WARNING);
+  assert.equal(store.status().migration, 'unknown');
 });
 test('a migrated vault does not depend on settings.json being readable', () => {
   const f = fixture({ envKeys: { KEY: secret }, theme: 'dusk' }); f.make().initialize();
@@ -484,7 +485,7 @@ test('a cleanup failure during first migration names settings.json, not the key 
   assert.equal(store.reveal('KEY').value, secret);
   assert.deepEqual(JSON.parse(f.files.get('settings')), { theme: 'dusk' });
 });
-test('retry on a usable store only retries cleanup and never needs the key store', () => {
+test('retry on an unchanged usable vault cleans known plaintext without the key store', () => {
   const f = fixture({ envKeys: { KEY: secret } }), store = f.make(); store.initialize();
   f.files.set('settings', 'unreadable fixture');
   assert.equal(store.retry().cleanupPending, true);
@@ -500,8 +501,137 @@ test('retry on a usable store only retries cleanup and never needs the key store
   // An unavailable store retries the whole initialization.
   f.encryption.isEncryptionAvailable = () => true;
   f.files.set('vault', 'damaged');
-  assert.equal(store.set('X', secret).ok, false); assert.equal(store.status().ok, false);
-  assert.equal(store.retry().ok, false);
+  assert.equal(store.set('X', secret).ok, false); assert.equal(store.status().ok, true);
+  assert.equal(store.retry().cleanupPending, true);
   f.files.set('vault', f.writes.filter(([file]) => file === 'vault').at(-1)[1]);
   assert.equal(store.retry().ok, true); assert.equal(store.reveal('KEY').value, secret);
+});
+
+function replaceVault(f, transform) {
+  const envelope=JSON.parse(f.files.get('vault'));
+  const doc=JSON.parse(f.encryption.decryptString(Buffer.from(envelope.ciphertext,'base64')));
+  transform(doc);
+  f.files.set('vault',JSON.stringify({version:1,ciphertext:f.encryption.encryptString(JSON.stringify(doc)).toString('base64')}));
+}
+for (const trigger of ['retry','restart','mutation']) test(`corrected named and legacy source is recovered through ${trigger}`,()=>{
+  const f=fixture({envKeys:{'BAD-NAME':secret},openaiKey:12,theme:'paper'}), s=f.make();
+  s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{GOOD_NAME:secret,'STILL-BAD':'dummy-skipped'},openaiKey:secret,theme:'dusk'}));
+  const active=trigger==='restart'?f.make():s;
+  const response=trigger==='restart'?active.initialize():trigger==='mutation'?active.set('UNRELATED','dummy-other'):active.retry();
+  assert.equal(response.ok,true); assert.equal(response.cleanupPending,false);
+  assert.equal(active.reveal('GOOD_NAME').value,secret); assert.equal(active.reveal('legacy:openaiKey').value,secret);
+  assert.deepEqual(response.skippedKeys,['STILL-BAD']);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{envKeys:{'STILL-BAD':'dummy-skipped'},theme:'dusk'});
+  for(const result of [response,active.list(),active.status()]) assert.ok(!JSON.stringify(result).includes(secret));
+  const restart=f.make(); restart.initialize(); assert.equal(restart.reveal('GOOD_NAME').value,secret);
+});
+test('failed encryption after loading a new vault cannot roll back keys or resurrect deletions',()=>{
+  const f=fixture({envKeys:{KEY:secret,GONE:secret}}), s=f.make();s.initialize();
+  replaceVault(f,doc=>{doc.named.KEY='dummy-new'; delete doc.named.GONE;doc.tombstones['named:GONE']=true;});
+  const encrypt=f.encryption.encryptString;
+  f.encryption.encryptString=()=>{throw Error(secret);};
+  assert.equal(s.set('OTHER','dummy-other').ok,false);
+  assert.equal(s.reveal('KEY').value,'dummy-new');assert.equal(s.reveal('GONE').value,'');
+  f.encryption.encryptString=encrypt;assert.equal(s.set('OTHER','dummy-other').ok,true);
+  const restart=f.make();restart.initialize();assert.equal(restart.reveal('KEY').value,'dummy-new');assert.equal(restart.reveal('GONE').value,'');
+});
+for(const damage of ['missing','corrupt','unreadable','undecryptable','unsupported']) test(`cleanup refuses ${damage} durable vault and keeps cached keys`,()=>{
+  const f=fixture({envKeys:{KEY:secret}}),s=f.make();s.initialize();
+  const vault=f.files.get('vault'),read=f.io.read,decrypt=f.encryption.decryptString;
+  const source=JSON.stringify({envKeys:{KEY:secret},theme:'paper'});f.files.set('settings',source);
+  if(damage==='missing') f.files.delete('vault');
+  if(damage==='corrupt') f.files.set('vault','broken');
+  if(damage==='unsupported') f.files.set('vault','{"version":99}');
+  if(damage==='unreadable') f.io.read=file=>{if(file==='vault')throw Error(secret);return read(file);};
+  if(damage==='undecryptable'){f.files.set('vault',vault+' ');f.encryption.decryptString=()=>{throw Error(secret);};}
+  const before=f.files.get('vault'),writes=f.writes.length;
+  const r=s.retry();assert.equal(r.cleanupPending,true);assert.equal(r.cleanupWarning,VAULT_WARNING);
+  assert.equal(s.reveal('KEY').value,secret);assert.equal(s.set('OTHER',secret).ok,false);
+  assert.equal(f.files.get('settings'),source);assert.equal(f.files.get('vault'),before);assert.equal(f.writes.length,writes);
+  assert.ok(!JSON.stringify(r).includes(secret));
+  f.io.read=read;f.encryption.decryptString=decrypt;f.files.set('vault',vault);
+  assert.equal(s.retry().cleanupPending,false);assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'paper'});
+});
+test('unchanged known-source cleanup needs zero crypto calls; unseen sources require encryption',()=>{
+  const f=fixture({envKeys:{KEY:secret}}),s=f.make();s.initialize();
+  const encrypt=f.encryption.encryptString,decrypt=f.encryption.decryptString;let calls=0;
+  f.encryption.encryptString=()=>{calls++;throw Error('locked');};f.encryption.decryptString=()=>{calls++;throw Error('locked');};
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:secret}}));
+  assert.equal(s.retry().cleanupPending,false);assert.equal(calls,0);
+  f.files.set('settings',JSON.stringify({envKeys:{NEW:secret}}));
+  assert.equal(s.retry().cleanupWarning,RECOVERY_WARNING);assert.equal(calls,1);
+  assert.equal(JSON.parse(f.files.get('settings')).envKeys.NEW,secret);assert.equal(s.reveal('KEY').value,secret);
+  f.encryption.encryptString=encrypt;f.encryption.decryptString=decrypt;
+  assert.equal(s.retry().cleanupPending,false);assert.equal(s.reveal('NEW').value,secret);
+});
+for(const phase of ['before-vault','after-vault','cleanup','after-cleanup']) test(`corrected-entry recovery survives ${phase} interruption`,()=>{
+  const f=fixture(),s=f.make();s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{NEW:secret},theme:'dusk'}));
+  const write=f.io.write;let failed=false;
+  f.io.write=(file,text)=>{
+    const hit=!failed && file===(phase.includes('vault')?'vault':'settings');
+    if(hit){failed=true;if(phase.startsWith('after'))write(file,text);throw Error(secret);}
+    write(file,text);
+  };
+  s.retry(); assert.equal(s.status().ok,true);
+  f.io.write=write;
+  const restart=f.make();assert.equal(restart.initialize().ok,true);assert.equal(restart.reveal('NEW').value,secret);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'dusk'});
+});
+test('a committed mutation stays successful when additional source recovery fails',()=>{
+  const f=fixture(),s=f.make();s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{NEW:secret}}));
+  const encrypt=f.encryption.encryptString;let calls=0;
+  f.encryption.encryptString=text=>{if(++calls===2)throw Error(secret);return encrypt(text);};
+  const res=s.set('SAVED','dummy-saved');assert.equal(res.ok,true);assert.equal(res.cleanupWarning,RECOVERY_WARNING);
+  assert.equal(s.reveal('SAVED').value,'dummy-saved');assert.equal(JSON.parse(f.files.get('settings')).envKeys.NEW,secret);
+  f.encryption.encryptString=encrypt;s.retry();assert.equal(s.reveal('NEW').value,secret);
+});
+test('replacement pending vault is recovered before cleanup and retains tombstone precedence',()=>{
+  const f=fixture({envKeys:{KEY:secret,GONE:secret}}),s=f.make();s.initialize();s.remove('GONE');
+  replaceVault(f,doc=>{doc.migration='pending';doc.named.KEY='dummy-new';});
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:secret,GONE:secret,NEW:secret},theme:'dusk'}));
+  const res=s.retry();assert.equal(res.ok,true);assert.equal(res.migration,'complete');
+  assert.equal(s.reveal('KEY').value,'dummy-new');assert.equal(s.reveal('GONE').value,'');assert.equal(s.reveal('NEW').value,secret);
+});
+test('completed source recovery preserves a late source key and fresh preferences',()=>{
+  const f=fixture(),s=f.make();s.initialize();const write=f.io.write;
+  f.files.set('settings',JSON.stringify({envKeys:{FIRST:secret},theme:'paper'}));let once=false;
+  f.io.write=(file,text)=>{write(file,text);if(file==='vault'&&!once){once=true;f.files.set('settings',JSON.stringify({envKeys:{FIRST:secret,LATE:secret},theme:'dusk'}));}};
+  assert.equal(s.retry().cleanupPending,true);assert.equal(JSON.parse(f.files.get('settings')).envKeys.LATE,secret);
+  assert.equal(s.retry().cleanupPending,false);assert.equal(s.reveal('LATE').value,secret);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'dusk'});
+});
+test('a changed completed vault is adopted before reconciling settings',()=>{
+  const f=fixture({envKeys:{KEY:secret}}),s=f.make();s.initialize();
+  replaceVault(f,doc=>{doc.named.KEY='dummy-new';});
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:secret,NEW:secret},openaiKey:secret,theme:'paper'}));
+  assert.equal(s.retry().cleanupPending,false);
+  assert.equal(s.reveal('KEY').value,'dummy-new');assert.equal(s.reveal('NEW').value,secret);
+  assert.equal(s.reveal('legacy:openaiKey').value,secret);
+  assert.deepEqual(JSON.parse(f.files.get('settings')),{theme:'paper'});
+});
+test('vault changes at the cleanup-read boundary preserve source without trusting the cache',()=>{
+  const f=fixture({envKeys:{KEY:secret}}),s=f.make();s.initialize();
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:secret}}));
+  const read=f.io.read;let count=0;
+  f.io.read=file=>{if(file==='settings'&&++count===2)f.files.set('vault','damaged fixture');return read(file);};
+  assert.equal(s.retry().cleanupWarning,VAULT_WARNING);
+  assert.equal(JSON.parse(f.files.get('settings')).envKeys.KEY,secret);
+  assert.equal(s.reveal('KEY').value,secret);
+});
+test('known app-saved entries and tombstones need no encryption to clean stale sources',()=>{
+  const f=fixture(),s=f.make();s.initialize();s.set('KEY',secret);s.set('GONE',secret);s.remove('GONE');
+  f.files.set('settings',JSON.stringify({envKeys:{KEY:'dummy-old',GONE:secret}}));
+  f.encryption.isEncryptionAvailable=()=>false;
+  f.encryption.encryptString=()=>{throw Error('must not encrypt');};f.encryption.decryptString=()=>{throw Error('must not decrypt');};
+  assert.equal(s.retry().cleanupPending,false);
+  assert.equal(s.reveal('KEY').value,secret);assert.equal(s.reveal('GONE').value,'');
+});
+test('a replacement pending vault still fails closed when its source cannot be read',()=>{
+  const f=fixture({envKeys:{KEY:secret}}),s=f.make();s.initialize();
+  replaceVault(f,doc=>{doc.migration='pending';});f.files.set('settings','invalid fixture');
+  assert.equal(s.retry().ok,false);assert.deepEqual(s.context(),{envKeys:{}});
+  assert.equal(f.files.get('settings'),'invalid fixture');
 });

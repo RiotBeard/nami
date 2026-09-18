@@ -34,8 +34,8 @@ that active plaintext fields are absent. This removes the extra-read race; it
 does not lock out arbitrary external writers. A second encrypted commit marks
 completion. Each transaction is synchronous in the main process; handlers in multiple windows cannot interleave.
 If an external writer changes source keys during migration, cleanup stops and
-preserves that source for retry. Completed startup validates the vault without
-rewriting it. Run separate development processes with separate profiles, as
+preserves that source for retry. Completed startup validates the vault without rewriting it unless previously
+unseen source entries need recovery. Run separate development processes with separate profiles, as
 described in CONTRIBUTING.md; the store does not coordinate independent processes.
 
 Migration takes only well-formed entries: an `envKeys` name that looks like an
@@ -43,14 +43,18 @@ environment variable with a text value, and legacy fields that are text. Anythin
 else (a name with a dash, a number, an `envKeys` that is not an object) is left
 untouched in `settings.json`, the migration still completes, and Settings → Keys
 shows a persistent warning naming the skipped entries, never their values, with a
-**Show settings.json** control. Fix or remove them there; the warning clears on
-the next check. Empty-string fields are stale and are removed, not imported.
+**Show settings.json** control. Corrected entries are encrypted and verified on
+the next check before their plaintext is removed. If protection or writing fails,
+the source remains with a cleanup warning; malformed entries remain untouched. Empty-string fields are stale and are removed, not imported.
 An empty or whitespace-only `settings.json` is an empty source, not a damaged one.
 
 A pending migration can be retried after interruption. Existing encrypted values,
 previously imported identifiers, and deletion tombstones win over old plaintext.
-Once migration is complete, restored plaintext fields are treated as stale and
-removed, not reimported. Re-enter intentionally restored keys through Settings.
+After migration, startup, Retry and successful key mutations reconcile source
+entries again. Previously unseen nonempty named and legacy entries are encrypted
+together with their imported identifiers, reread and verified before cleanup.
+Known entries are stale: existing encrypted values, prior imported identifiers
+and deletion tombstones win. Use Settings to intentionally replace those values.
 Deleting `OPENAI_API_KEY` or `ELEVENLABS_API_KEY` also removes the associated legacy
 provider key. Legacy entries, including unused `sttKey`, are separately visible
 in Keys with explicit Show and Remove controls.
@@ -73,16 +77,19 @@ from all keep working; a keyed speech provider with no key anywhere reports that
 saved keys are unavailable instead of "no API key". Reads are served from the
 vault this process last verified, so one failed save (a full disk, a locked key
 store) returns an error for that save and leaves existing keys usable. The store
-becomes unavailable when a vault read no longer verifies. If Retry cannot even
-access system protection, it reports the failed retry without discarding verified
-in-memory keys; a fresh process without cached keys still fails closed.
+retains already-verified completed keys in memory if the durable vault later
+becomes missing, damaged or temporarily undecryptable. Mutations and destructive
+cleanup are blocked until that vault can be verified; Settings shows the blocker
+as a cleanup warning. A fresh process without cached keys and a pending initial
+migration still fail closed.
 
 An unreadable `settings.json` is reported separately, naming the file, with a
 **show settings.json** link in Settings → Keys. While a migration has not
 finished, the keys to import live there, so Nami never replaces it through a
 preference save; theme, view and other saves report that error instead. Once the
-vault is complete, `settings.json` holds only preferences and a damaged file is
-replaced by the next preference save, as before encryption. If the cleanup write
+vault is complete, a damaged settings file can be replaced by the next preference
+save, as before encryption. Skipped or newly added keys may still be in that file;
+fix or recover them before choosing to replace a damaged settings file. If the cleanup write
 during migration fails (for example a read-only `settings.json`), the error names
 that file and its permissions rather than the key store.
 
@@ -96,11 +103,20 @@ storage; plaintext cleanup is incomplete”. A completed vault with unreadable
 settings also shows this warning instead of disabling keys.
 
 Cleanup is rechecked at startup, after committed mutations, and through Retry.
-On a usable store, Retry only retries cleanup and never needs the key store, so
-a locked Keychain cannot block it or contradict a working Keys pane. Only an
-unavailable store restarts the whole initialization on Retry. A save that fails
-before anything reaches disk (a locked Keychain, unusable ciphertext, a failed
-rename) leaves the verified keys in memory and on disk exactly as they were.
+Before cleanup, Nami compares the durable vault bytes to the verified snapshot.
+Unchanged ciphertext and already-known source entries need no Keychain access.
+Changed ciphertext must be decrypted and validated; missing, unreadable, corrupt
+or unsupported ciphertext blocks cleanup and preserves the plaintext source.
+Previously unseen source entries require encryption even when the vault is
+unchanged. A locked Keychain can therefore block source recovery while cached
+keys remain usable. A valid replacement pending vault resumes initial migration.
+
+The cached raw ciphertext and decoded document are adopted together. A failed
+save cannot label new ciphertext as verified while keeping an old decoded cache.
+After an attempted atomic write, Nami verifies which version reached disk before
+reporting whether the operation committed. No cleanup trusts a cache whose
+persisted bytes no longer match.
+
 Its status is recomputed from settings on restart; no credential-file format
 change is required. The warning clears only after plaintext fields are confirmed
 absent. Restore settings readability/write access and retry. Initial pending
@@ -138,7 +154,9 @@ restarts, tests the Settings controls and recovery after damaged ciphertext,
 then exercises incomplete-cleanup warnings with unreadable disposable settings,
 truthful deletion notices, cleanup retry after restoring the fixture, a skipped
 malformed `envKeys` entry that stays in `settings.json`, and a preference save
-that replaces a damaged `settings.json` once migration is complete.
+that replaces a damaged `settings.json` once migration is complete. It also
+corrects a skipped key and verifies encrypted recovery across restart, and checks
+that Retry preserves plaintext when the durable vault is corrupted mid-run.
 The script does not request live agent-account status and removes the profile
 after testing. It opens a localhost debugging
 endpoint only for these test launches and closes the app processes afterward.

@@ -178,7 +178,8 @@ function readSettings() { return preferences(settingsStore.readSettings({ file: 
 function writeSettings(patch) {
   // Until migration is known to be complete, settings.json may still hold keys
   // to import, so an unreadable one is never replaced through the preferences
-  // path. Afterwards it holds only preferences and a bad file self-heals.
+  // path. A completed vault permits the existing preference self-healing policy;
+  // valid settings may still contain skipped entries or new keys awaiting recovery.
   if (credentialStore().status().migration !== 'complete' && !credentialStore().settingsReadable()) return { ok: false, error: SETTINGS_ERROR };
   let cleanup = {};
   if (LEGACY.some(k => Object.prototype.hasOwnProperty.call(patch, k))) {
