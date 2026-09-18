@@ -13,7 +13,8 @@ const profile = path.join(temp, 'Nami-dev');
 fs.mkdirSync(profile);
 const secret = ['dummy','keychain','smoke','123456789'].join('-');
 const saved = 'dummy-restart-key-987654321';
-fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ theme: 'glass', envKeys: { SMOKE_KEY: secret }, openaiKey: secret, sttKey: secret }));
+const skipped = 'skipped-dummy-value-555';
+fs.writeFileSync(path.join(profile, 'settings.json'), JSON.stringify({ theme: 'glass', envKeys: { SMOKE_KEY: secret, 'BAD-NAME': skipped }, openaiKey: secret, sttKey: secret }));
 const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
 const request = url => new Promise((resolve,reject) => http.get(url, res => { let text=''; res.on('data',c=>text+=c); res.on('end',()=>{try{resolve(JSON.parse(text));}catch(e){reject(e);}}); }).on('error',reject));
 async function until(fn, description) {
@@ -49,7 +50,7 @@ async function launch(check) {
     }
     await until(()=>evaluate('typeof dainami !== "undefined"'),'preload bridge');
     await check(evaluate);
-    assert.ok(!output.includes(secret)&&!output.includes(saved),'no secret in app logs');
+    assert.ok(!output.includes(secret)&&!output.includes(saved)&&!output.includes(skipped),'no secret in app logs');
   } finally {
     socket?.close();
     try { process.kill(-child.pid,'SIGTERM'); } catch {}
@@ -63,12 +64,18 @@ async function launch(check) {
       const keys=await run('dainami.keysGet()'); assert.equal(keys.ok,true,'real safeStorage is available');
       assert.equal((await run('dainami.keysReveal("SMOKE_KEY")')).value,secret);
       assert.ok(!JSON.stringify(keys).includes(secret));
+      // A malformed entry is skipped by name, stays in settings.json, and does not block migration.
+      assert.deepEqual(keys.skippedKeys,['BAD-NAME']); assert.ok(!JSON.stringify(keys).includes(skipped));
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(profile,'settings.json'),'utf8')).envKeys,{'BAD-NAME':skipped});
       for(const expression of ['dainami.boot()','dainami.settingsGet()','dainami.themeSet("glass")','dainami.viewSet("desk")','dainami.settingsSet({openaiModel:"whisper-1"})']) assert.ok(!JSON.stringify(await run(expression)).includes(secret));
       await until(()=>run('!!document.querySelector("#btn-settings")'),'Settings button');
       await run('document.querySelector("#btn-settings").click()');
       await until(()=>run('!!document.querySelector("[data-sec=keys]")'),'Keys tab');
       await run('document.querySelector("[data-sec=keys]").click()');
       await until(()=>run('!!document.querySelector("#key-new-save")'),'Keys controls');
+      await until(()=>run('!!document.querySelector("#keys-skipped-warning")'),'skipped-entry warning');
+      assert.ok((await run('document.querySelector("#keys-skipped-warning").innerText')).includes('BAD-NAME'));
+      assert.ok(!(await run('document.querySelector("#set-pane").innerText')).includes(skipped));
       await run(`document.querySelector('#key-new-name').value='UI_KEY'; document.querySelector('#key-new-val').value=${JSON.stringify(secret)}; document.querySelector('#key-new-save').click()`);
       await until(()=>run(`!!document.querySelector('[data-key="UI_KEY"] [data-act="show"]')`),'saved key row');
       assert.ok(!(await run('document.querySelector("#set-pane").innerText')).includes(secret));
@@ -84,6 +91,9 @@ async function launch(check) {
       assert.equal((await run(`dainami.keysSet("RESTART_KEY",${JSON.stringify(saved)})`)).ok,true);
       assert.equal((await run('dainami.keysDelete("SMOKE_KEY")')).ok,true);
       assert.equal((await run('dainami.keysDelete("legacy:sttKey")')).ok,true);
+      // Removing the bad entry by hand clears the warning on the next check.
+      fs.writeFileSync(path.join(profile,'settings.json'),JSON.stringify({theme:'glass'}));
+      assert.deepEqual((await run('dainami.keysRetry()')).skippedKeys,[]);
       assert.ok(!fs.readFileSync(path.join(profile,'settings.json'),'utf8').includes(secret));
       assert.ok(!fs.readFileSync(path.join(profile,'credentials.json'),'utf8').includes(secret));
       assert.equal(fs.statSync(path.join(profile,'credentials.json')).mode & 0o777,0o600);
@@ -147,12 +157,16 @@ async function launch(check) {
       assert.equal(cleaned.cleanupPending,false); assert.equal(cleaned.cleanupWarning,null);
       assert.equal((await run('dainami.keysReveal("CLEANUP_KEY")')).value,'');
       assert.deepEqual(JSON.parse(fs.readFileSync(settingsFile,'utf8')),{theme:'dusk'});
-
+      // Migration is complete, so a damaged preferences file self-heals on the next save.
+      fs.writeFileSync(settingsFile,'damaged preferences fixture');
+      assert.equal((await run('dainami.settingsSet({openaiModel:"whisper-1"})')).ok,true);
+      assert.equal(JSON.parse(fs.readFileSync(settingsFile,'utf8')).openaiModel,'whisper-1');
+      assert.equal((await run('dainami.keysReveal("RESTART_KEY")')).value,'');
     });
-    console.log('PASS: corrupt vault recovery; incomplete cleanup warns with usable keys; deletion notice and Retry cleanup remove stale plaintext');
+    console.log('PASS: corrupt vault recovery; incomplete cleanup warns with usable keys; deletion notice and Retry cleanup remove stale plaintext; damaged preferences self-heal after migration');
   } catch(error) {
     // Assertions can contain actual values; keep fixture diagnostics secret-free.
-    console.error('FAIL: '+String(error.message).replaceAll(secret,'[redacted]').replaceAll(saved,'[redacted]'));
+    console.error('FAIL: '+String(error.message).replaceAll(secret,'[redacted]').replaceAll(saved,'[redacted]').replaceAll(skipped,'[redacted]'));
     process.exitCode=1;
   } finally { fs.rmSync(temp,{recursive:true,force:true,maxRetries:5}); }
 })();

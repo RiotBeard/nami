@@ -38,6 +38,15 @@ preserves that source for retry. Completed startup validates the vault without
 rewriting it. Run separate development processes with separate profiles, as
 described in CONTRIBUTING.md; the store does not coordinate independent processes.
 
+Migration takes only well-formed entries: an `envKeys` name that looks like an
+environment variable with a text value, and legacy fields that are text. Anything
+else (a name with a dash, a number, an `envKeys` that is not an object) is left
+untouched in `settings.json`, the migration still completes, and Settings → Keys
+shows a persistent warning naming the skipped entries, never their values, with a
+**Show settings.json** control. Fix or remove them there; the warning clears on
+the next check. Empty-string fields are stale and are removed, not imported.
+An empty or whitespace-only `settings.json` is an empty source, not a damaged one.
+
 A pending migration can be retried after interruption. Existing encrypted values,
 previously imported identifiers, and deletion tombstones win over old plaintext.
 Once migration is complete, restored plaintext fields are treated as stale and
@@ -69,9 +78,13 @@ access system protection, it reports the failed retry without discarding verifie
 in-memory keys; a fresh process without cached keys still fails closed.
 
 An unreadable `settings.json` is reported separately, naming the file, with a
-**show settings.json** link in Settings → Keys. Nami never replaces it through a
-preference save. It blocks a migration that has not finished, because the keys
-to import live there, but not a vault that has already been migrated.
+**show settings.json** link in Settings → Keys. While a migration has not
+finished, the keys to import live there, so Nami never replaces it through a
+preference save; theme, view and other saves report that error instead. Once the
+vault is complete, `settings.json` holds only preferences and a damaged file is
+replaced by the next preference save, as before encryption. If the cleanup write
+during migration fails (for example a read-only `settings.json`), the error names
+that file and its permissions rather than the key store.
 
 Vault availability and plaintext cleanup are reported separately as `ok`,
 `cleanupPending`, and a sanitized `cleanupWarning`. When a save or deletion has
@@ -83,6 +96,11 @@ storage; plaintext cleanup is incomplete”. A completed vault with unreadable
 settings also shows this warning instead of disabling keys.
 
 Cleanup is rechecked at startup, after committed mutations, and through Retry.
+On a usable store, Retry only retries cleanup and never needs the key store, so
+a locked Keychain cannot block it or contradict a working Keys pane. Only an
+unavailable store restarts the whole initialization on Retry. A save that fails
+before anything reaches disk (a locked Keychain, unusable ciphertext, a failed
+rename) leaves the verified keys in memory and on disk exactly as they were.
 Its status is recomputed from settings on restart; no credential-file format
 change is required. The warning clears only after plaintext fields are confirmed
 absent. Restore settings readability/write access and retry. Initial pending
@@ -118,7 +136,9 @@ with a disposable `Nami-dev` profile and dummy secrets. It uses real safeStorage
 checks migration, Reveal, masking, encrypted persistence and deletion across
 restarts, tests the Settings controls and recovery after damaged ciphertext,
 then exercises incomplete-cleanup warnings with unreadable disposable settings,
-truthful deletion notices, and cleanup retry after restoring the fixture.
+truthful deletion notices, cleanup retry after restoring the fixture, a skipped
+malformed `envKeys` entry that stays in `settings.json`, and a preference save
+that replaces a damaged `settings.json` once migration is complete.
 The script does not request live agent-account status and removes the profile
 after testing. It opens a localhost debugging
 endpoint only for these test launches and closes the app processes afterward.
